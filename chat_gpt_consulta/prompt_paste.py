@@ -79,7 +79,7 @@ class ChatGPTSession:
             return True
         return self.connect()
 
-    def evaluate(self, expression: str, timeout: int = 10) -> str | None:
+    def evaluate(self, expression: str, timeout: int = 10, await_promise: bool = False) -> str | None:
         """Evalúa JavaScript en la página de ChatGPT."""
         if not self._ensure_connected():
             return None
@@ -91,7 +91,7 @@ class ChatGPTSession:
             "params": {
                 "expression": expression,
                 "returnByValue": True,
-                "awaitPromise": False,
+                "awaitPromise": await_promise,
             }
         })
 

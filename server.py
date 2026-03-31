@@ -228,6 +228,11 @@ class PromptRequest(BaseModel):
     wait_response: bool = False
     timeout: int = 120
 
+class ImageDownloadRequest(BaseModel):
+    port: int
+    output_dir: str = ""
+    timeout: int = 300
+
 
 # ── Auto-launch ──────────────────────────────────────────────────────────────
 
@@ -282,6 +287,7 @@ def index():
             "POST /profiles/close",
             "POST /profiles/hook",
             "POST /chatgpt/prompt",
+            "POST /chatgpt/download-image",
         ],
     })
 
@@ -382,6 +388,22 @@ def chatgpt_prompt(req: PromptRequest):
         )
         if result.get("success"):
             return success_response(data=result, message="Prompt enviado a ChatGPT")
+        return error_response(result.get("error", "Error desconocido"), 500)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+@app.post("/chatgpt/download-image")
+def chatgpt_download_image(req: ImageDownloadRequest):
+    try:
+        from chat_gpt_consulta.image_download import wait_and_download_image
+        result = wait_and_download_image(
+            port=req.port,
+            output_dir=req.output_dir,
+            timeout=req.timeout,
+        )
+        if result.get("success"):
+            return success_response(data=result, message="Imagen descargada")
         return error_response(result.get("error", "Error desconocido"), 500)
     except Exception as e:
         return error_response(str(e), 500)
