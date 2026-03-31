@@ -1,23 +1,18 @@
 """
 CDP Bridge — Controla DICloak via Chrome DevTools Protocol.
 
-Se conecta al CDP de DICloak (puerto 9333) para:
-- Listar perfiles disponibles
-- Abrir/cerrar perfiles
-- Detectar puertos CDP dinámicos de ginsbrowser
-
 Mantiene conexión WebSocket persistente para evitar reconexiones lentas.
+Standalone — no depende de core.
 """
 from __future__ import annotations
 
 import json
 import re
-import socket
 import time
 import urllib.request
 from dataclasses import dataclass
 
-from core.utils.logger import log_info, log_ok, log_warn, log_error
+from logger import log_info, log_ok, log_warn, log_error
 
 
 DEFAULT_DICLOAK_PORT = 9333
@@ -70,21 +65,14 @@ def _get_page_ws_url(port: int = DEFAULT_DICLOAK_PORT) -> str:
 # ── Persistent CDP Connection ────────────────────────────────────────────────
 
 class CDPConnection:
-    """Conexión WebSocket persistente al CDP de DiCloak (9333).
-
-    Se conecta una vez al iniciar el servidor y reutiliza la conexión
-    para todas las evaluaciones de JavaScript. Sin reconexiones, sin
-    ThreadPoolExecutor, sin asyncio.run() por cada llamada.
-    """
+    """Conexión WebSocket persistente al CDP de DiCloak (9333)."""
 
     def __init__(self, port: int = DEFAULT_DICLOAK_PORT):
         self.port = port
         self._ws = None
         self._msg_id = 0
-        self._ws_url = ""
 
     def connect(self) -> bool:
-        """Conecta al WebSocket del CDP de DiCloak."""
         try:
             import websockets.sync.client as ws_sync
         except ImportError:
@@ -92,14 +80,14 @@ class CDPConnection:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
             import websockets.sync.client as ws_sync
 
-        self._ws_url = _get_page_ws_url(self.port)
-        if not self._ws_url:
+        ws_url = _get_page_ws_url(self.port)
+        if not ws_url:
             log_warn(f"No se encontró WebSocket URL en puerto {self.port}")
             return False
 
         try:
-            self._ws = ws_sync.connect(self._ws_url, max_size=2**22)
-            log_ok(f"CDP conectado: {self._ws_url[:60]}")
+            self._ws = ws_sync.connect(ws_url, max_size=2**22)
+            log_ok(f"CDP conectado: {ws_url[:60]}")
             return True
         except Exception as e:
             log_warn(f"Error conectando CDP WebSocket: {e}")
@@ -122,7 +110,6 @@ class CDPConnection:
         return self.connect()
 
     def evaluate(self, expression: str, timeout: int = 8) -> str | None:
-        """Evalúa JS en DiCloak. Usa la conexión persistente."""
         if not self._ensure_connected():
             return None
 
@@ -153,12 +140,11 @@ class CDPConnection:
             self._ws = None
 
 
-# Conexión global — se inicializa al arrancar el servidor
+# Conexión global
 _cdp: CDPConnection | None = None
 
 
 def get_cdp(port: int = DEFAULT_DICLOAK_PORT) -> CDPConnection:
-    """Obtiene la conexión CDP global, creándola si no existe."""
     global _cdp
     if _cdp is None or _cdp.port != port:
         _cdp = CDPConnection(port)
@@ -166,25 +152,18 @@ def get_cdp(port: int = DEFAULT_DICLOAK_PORT) -> CDPConnection:
 
 
 def init_cdp(port: int = DEFAULT_DICLOAK_PORT) -> bool:
-    """Inicializa la conexión CDP y el hook al arrancar el servidor."""
     cdp = get_cdp(port)
     if not cdp.connect():
         return False
-
-    # Inyectar hook CDP de una vez
     ok = inject_cdp_hook(port)
     if ok:
         log_ok("Hook CDP inyectado al iniciar servidor")
     else:
         log_warn("No se pudo inyectar hook CDP al iniciar")
-
     return True
 
 
-# ── Funciones de compatibilidad (usan conexión persistente) ──────────────────
-
 def cdp_evaluate_sync(expression: str, port: int = DEFAULT_DICLOAK_PORT, timeout: int = 8) -> str | None:
-    """Evalúa JS usando la conexión persistente."""
     return get_cdp(port).evaluate(expression, timeout)
 
 
@@ -267,10 +246,8 @@ def inject_cdp_hook(port: int = DEFAULT_DICLOAK_PORT) -> bool:
 
 
 def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) -> bool:
-    """Abre un perfil en DiCloak con un solo evaluate (hook ya inyectado al inicio)."""
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
-    # Un solo JS que busca y hace click — sin inyectar hook (ya se hizo al iniciar)
     open_js = f"""(() => {{
         try {{
             const targetName = "{safe_name}".toLowerCase().trim();
@@ -286,9 +263,7 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
                 }}
             }}
 
-            if (!targetRow) {{
-                return 'PROFILE_NOT_FOUND';
-            }}
+            if (!targetRow) return 'PROFILE_NOT_FOUND';
 
             const buttons = Array.from(targetRow.querySelectorAll('button, a, [role="button"], .el-button'));
             const openBtn = buttons.find(b => {{
@@ -296,25 +271,16 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
                 return text === 'abrir' || text === 'open' || text === 'launch' || text === 'iniciar';
             }});
 
-            if (openBtn) {{
-                openBtn.click();
-                return 'CLICKED_OPEN';
-            }}
+            if (openBtn) {{ openBtn.click(); return 'CLICKED_OPEN'; }}
 
             const fallbackBtn = buttons.find(b => {{
                 const text = (b.innerText || '').trim().toLowerCase();
                 return text !== '' && text !== 'select' && !b.querySelector('input[type="checkbox"]');
             }});
 
-            if (fallbackBtn) {{
-                fallbackBtn.click();
-                return 'CLICKED_FALLBACK';
-            }}
-
+            if (fallbackBtn) {{ fallbackBtn.click(); return 'CLICKED_FALLBACK'; }}
             return 'NO_OPEN_BUTTON';
-        }} catch(e) {{
-            return 'ERROR: ' + e.message;
-        }}
+        }} catch(e) {{ return 'ERROR: ' + e.message; }}
     }})()"""
 
     result = cdp_evaluate_sync(open_js, port, timeout=5)
@@ -329,11 +295,9 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
 
 
 def detect_ginsbrowser_port(timeout_sec: int = 60) -> int:
-    """Detecta el puerto CDP del navegador ginsbrowser via cdp_debug_info.json."""
-    from core.cfg.platform import read_cdp_debug_info
+    from platform_utils import read_cdp_debug_info
 
     deadline = time.time() + timeout_sec
-
     while time.time() < deadline:
         data = read_cdp_debug_info()
         for entry in data.values():
@@ -345,7 +309,5 @@ def detect_ginsbrowser_port(timeout_sec: int = 60) -> int:
                 continue
             if port and _test_cdp_port(port):
                 return port
-
         time.sleep(0.5)
-
     return 0

@@ -1,9 +1,9 @@
 """
-DICloak API Server — Servidor REST para controlar DICloak via CDP.
+DICloak API Server — Servidor REST standalone para controlar DICloak via CDP.
 
 Uso:
-  python -m core.dicloak_api.server
-  python -m core.dicloak_api.server --port 52140 --dicloak-port 9333
+  python server.py
+  python server.py --port 8585 --dicloak-port 9333
 
 Endpoints:
   GET  /                    → Info del servidor
@@ -16,9 +16,10 @@ Endpoints:
 """
 from __future__ import annotations
 
+import json as _json
 import os
 import re
-import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -26,9 +27,10 @@ from typing import Any
 
 # ── Project setup ─────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Cargar .env si existe
 env_path = PROJECT_ROOT / ".env"
 if env_path.exists():
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -37,15 +39,13 @@ if env_path.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-import json as _json
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn
 
-from core.dicloak_api.cdp_bridge import (
+from cdp_bridge import (
     is_dicloak_ready,
     get_dicloak_targets,
     list_profiles_via_cdp,
@@ -57,11 +57,12 @@ from core.dicloak_api.cdp_bridge import (
     init_cdp,
     DEFAULT_DICLOAK_PORT,
 )
-from core.cfg.platform import (
+from platform_utils import (
     find_dicloak_exe,
     launch_detached,
     get_process_list,
     get_browser_process_name,
+    read_cdp_debug_info,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -69,10 +70,9 @@ from core.cfg.platform import (
 SERVER_PORT = int(os.environ.get("DICLOAK_API_PORT", "0") or "0") or 8585
 DICLOAK_PORT = int(os.environ.get("CDP_DICLOAK_PORT", "0") or "0") or DEFAULT_DICLOAK_PORT
 
-# ── Response helpers (Single Responsibility) ──────────────────────────────────
+# ── Response helpers ──────────────────────────────────────────────────────────
 
 def success_response(data: Any = None, message: str = "OK") -> Response:
-    """Respuesta exitosa estandarizada con JSON formateado."""
     body = {"success": True, "message": message}
     if data is not None:
         body["data"] = data
@@ -84,7 +84,6 @@ def success_response(data: Any = None, message: str = "OK") -> Response:
 
 
 def error_response(message: str, status_code: int = 500, details: Any = None) -> Response:
-    """Respuesta de error estandarizada con JSON formateado."""
     body = {"success": False, "error": message}
     if details is not None:
         body["details"] = details
@@ -95,10 +94,9 @@ def error_response(message: str, status_code: int = 500, details: Any = None) ->
     )
 
 
-# ── Service layer (Single Responsibility + Open/Closed) ──────────────────────
+# ── Service layer ─────────────────────────────────────────────────────────────
 
 class DICloakService:
-    """Servicio que encapsula la lógica de negocio para DICloak."""
 
     def __init__(self, dicloak_port: int = DEFAULT_DICLOAK_PORT):
         self.port = dicloak_port
@@ -114,7 +112,7 @@ class DICloakService:
 
     def get_profiles(self) -> list[dict]:
         if not is_dicloak_ready(self.port):
-            raise ConnectionError("DICloak no responde en puerto CDP. Verifica que este abierto.")
+            raise ConnectionError("DICloak no responde en puerto CDP.")
         profiles = list_profiles_via_cdp(self.port)
         return [{"id": p.id, "name": p.name, "status": p.status} for p in profiles]
 
@@ -146,8 +144,7 @@ class DICloakService:
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde. Verifica que este abierto.")
 
-        # Si ya hay un perfil abierto con CDP activo, reutilizarlo
-        from core.cfg.platform import read_cdp_debug_info
+        # Reutilizar perfil abierto si CDP activo
         data = read_cdp_debug_info()
         for entry in data.values():
             if not isinstance(entry, dict):
@@ -171,7 +168,6 @@ class DICloakService:
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
-        # Responder inmediato — el puerto se detecta después via cdp_debug_info.json
         return {
             "name": name,
             "debug_port": 0,
@@ -181,12 +177,13 @@ class DICloakService:
         }
 
     def close_profiles(self) -> int:
-        import subprocess
         try:
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "ginsbrowser.exe"],
-                capture_output=True, timeout=5,
-            )
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/IM", "ginsbrowser.exe"],
+                               capture_output=True, timeout=5)
+            else:
+                subprocess.run(["pkill", "-f", "ginsbrowser"],
+                               capture_output=True, timeout=5)
             return 1
         except Exception:
             return 0
@@ -211,7 +208,6 @@ class CloseProfileRequest(BaseModel):
 # ── Auto-launch ──────────────────────────────────────────────────────────────
 
 def ensure_dicloak_running(port: int = DEFAULT_DICLOAK_PORT, timeout: int = 20) -> bool:
-    """Abre DICloak en modo depuracion si no esta corriendo."""
     if is_dicloak_ready(port):
         print(f"[OK] DICloak ya responde en puerto {port}")
         return True
@@ -263,7 +259,6 @@ def index():
         ],
     })
 
-
 @app.get("/health")
 def health():
     try:
@@ -272,7 +267,6 @@ def health():
         return success_response(data=data, message=status)
     except Exception as e:
         return error_response(str(e), 500)
-
 
 @app.get("/profiles")
 def list_profiles():
@@ -284,7 +278,6 @@ def list_profiles():
     except Exception as e:
         return error_response(str(e), 500)
 
-
 @app.get("/profiles/running")
 def running_profiles():
     try:
@@ -292,7 +285,6 @@ def running_profiles():
         return success_response(data={"count": len(running), "profiles": running})
     except Exception as e:
         return error_response(str(e), 500)
-
 
 @app.post("/profiles/open")
 def open_profile(req: OpenProfileRequest):
@@ -310,7 +302,6 @@ def open_profile(req: OpenProfileRequest):
     except Exception as e:
         return error_response(str(e), 500)
 
-
 @app.post("/profiles/close")
 def close_profiles(req: CloseProfileRequest = None):
     try:
@@ -321,7 +312,6 @@ def close_profiles(req: CloseProfileRequest = None):
         )
     except Exception as e:
         return error_response(str(e), 500)
-
 
 @app.post("/profiles/hook")
 def inject_hook():
@@ -355,14 +345,13 @@ def main():
 
     ensure_dicloak_running(dicloak_port)
 
-    # Esperar a que DiCloak cargue su página (WebSocket URL disponible)
-    for i in range(15):
-        ws = _get_page_ws_url(dicloak_port)
-        if ws:
+    # Esperar a que DiCloak cargue su página
+    for _ in range(15):
+        if _get_page_ws_url(dicloak_port):
             break
         time.sleep(1)
 
-    # Conectar CDP + inyectar hook ANTES de arrancar el servidor
+    # Conectar CDP + hook
     if init_cdp(dicloak_port):
         print("[OK] CDP conectado y hook inyectado — listo para abrir perfiles")
     else:
@@ -370,12 +359,12 @@ def main():
 
     dev_mode = os.environ.get("DEV_RELOAD", "0") == "1"
     uvicorn.run(
-        "core.dicloak_api.server:app",
+        "server:app",
         host="0.0.0.0",
         port=server_port,
         log_level="info",
         reload=dev_mode,
-        reload_dirs=[str(PROJECT_ROOT / "core" / "dicloak_api")] if dev_mode else [],
+        reload_dirs=[str(PROJECT_ROOT)] if dev_mode else [],
     )
 
 

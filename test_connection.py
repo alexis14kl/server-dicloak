@@ -12,11 +12,10 @@ import argparse
 import sys
 import os
 
-# Agregar project root al path
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core.dicloak_api.client import DICloakAPI
+from api import DICloakAPI
 
 
 def main():

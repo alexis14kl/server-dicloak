@@ -19,7 +19,7 @@ import urllib.error
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.utils.logger import log_info, log_ok, log_warn, log_error
+from logger import log_info, log_ok, log_warn, log_error
 
 
 @dataclass

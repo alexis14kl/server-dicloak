@@ -10,6 +10,6 @@ Requiere:
   - DICLOAK_API_KEY en .env
 """
 
-from core.dicloak_api.api import DICloakAPI
+from api import DICloakAPI
 
 __all__ = ["DICloakAPI"]
