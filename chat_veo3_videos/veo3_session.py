@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error
-from platform_utils import os_click, IS_WINDOWS
+from platform_utils import (
+    os_click, os_click_window, find_browser_hwnd,
+    get_visible_hwnds, find_new_tooltip_hwnd, get_window_size, IS_WINDOWS,
+)
 
 
 VEO3_URL = "https://labs.google/fx/tools/flow"
@@ -221,7 +224,11 @@ class Veo3Session:
 
             if clicked and clicked != "null":
                 log_ok(f"Click en cuenta de Google ({clicked})")
-                time.sleep(4)
+                time.sleep(3)
+
+                # Reconectar — el click navega a otra página y rompe el WebSocket
+                self._ws = None
+                self.connect()
 
                 # Verificar si necesita contraseña
                 url_after = (self.evaluate("window.location.href") or "").lower()
@@ -242,7 +249,9 @@ class Veo3Session:
                         });
                         if (next) next.click();
                     })()""")
-                    time.sleep(5)
+                    time.sleep(4)
+                    self._ws = None
+                    self.connect()
                 continue
 
             # No encontró cuenta — buscar botón "Sign in with Google"
@@ -257,12 +266,23 @@ class Veo3Session:
                 if (btn) btn.click();
             })()""")
             time.sleep(4)
+            self._ws = None
+            self.connect()
 
-        # Verificación final
+        # Verificación final — usar misma lógica que is_on_flow()
         final_url = (self.evaluate("window.location.href") or "").lower()
-        if "labs.google" in final_url:
+        if self.is_on_flow():
             log_ok("Login completado")
             return True
+
+        # Si llegó a labs.google pero con error, re-navegar
+        if "labs.google" in final_url:
+            log_info("En labs.google con error, re-navegando a Flow...")
+            self.navigate(VEO3_URL)
+            time.sleep(5)
+            if self.is_on_flow():
+                log_ok("Login completado tras re-navegación")
+                return True
 
         log_error("No se pudo completar el login de Google")
         return False
@@ -296,10 +316,16 @@ class Veo3Session:
             return None
 
     def _handle_password_page(self) -> bool:
-        """Maneja la página de contraseña de Google usando OS click para activar
-        el autofill nativo de DiCloak (tooltip que solo responde a clicks reales del SO).
+        """Maneja la página de contraseña de Google activando el autofill de DiCloak.
 
-        Flujo: click en campo password → esperar tooltip → click en tooltip → verificar → Siguiente
+        Usa pywinauto para clicks sin mover el cursor del usuario:
+        1. Busca la ventana del browser por HWND
+        2. Click en campo password → abre tooltip de DiCloak (ventana separada)
+        3. Detecta la ventana del tooltip (Chrome_WidgetWin_*)
+        4. Click en el centro del tooltip → DiCloak llena la contraseña
+        5. Click CDP en Siguiente
+
+        Fallback a pyautogui (mueve cursor) si pywinauto no está disponible.
         """
         # 1. Obtener coordenadas del campo password
         pwd_coords = self._get_screen_coords('input[name="Passwd"]')
@@ -309,44 +335,94 @@ class Veo3Session:
             log_warn("No se encontró campo de contraseña")
             return False
 
-        # 2. Traer página al frente
-        self._send_raw("Page.bringToFront")
-        time.sleep(0.5)
+        chrome_h = pwd_coords["chromeH"]
+        client_x = int(pwd_coords["cx"])
+        client_y = int(chrome_h + pwd_coords["cy"])
 
-        # 3. Click OS en campo password
-        log_info(f"Click OS en campo password ({pwd_coords['screen_cx']}, {pwd_coords['screen_cy']})")
-        os_click(pwd_coords["screen_cx"], pwd_coords["screen_cy"])
-        time.sleep(2)
+        # 2. Buscar ventana del browser
+        browser_hwnd = find_browser_hwnd(int(pwd_coords["screenX"]))
 
-        # 4. Verificar si ya se llenó
-        pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
-        if pwd_len and int(pwd_len) > 0:
-            log_ok(f"Password llenado automáticamente ({pwd_len} chars)")
+        if browser_hwnd:
+            # === Ruta pywinauto (sin mover cursor) ===
+            log_info("Usando pywinauto para autofill (sin mover cursor)")
+
+            # Snapshot de ventanas antes del click
+            hwnds_before = get_visible_hwnds()
+
+            # Click en campo password
+            os_click_window(browser_hwnd, client_x, client_y)
+            time.sleep(2)
+
+            # Verificar si ya se llenó
+            pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
+            if pwd_len and int(pwd_len) > 0:
+                log_ok(f"Password llenado automáticamente ({pwd_len} chars)")
+            else:
+                # Buscar ventana del tooltip (Chrome_WidgetWin_*) con retry
+                tooltip_hwnd = None
+                for attempt in range(3):
+                    tooltip_hwnd = find_new_tooltip_hwnd(hwnds_before)
+                    if tooltip_hwnd:
+                        break
+                    # Re-click y esperar más
+                    time.sleep(1)
+                    hwnds_before = get_visible_hwnds()
+                    os_click_window(browser_hwnd, client_x, client_y)
+                    time.sleep(2)
+
+                if tooltip_hwnd:
+                    tw, th = get_window_size(tooltip_hwnd)
+                    log_info(f"Tooltip encontrado (hwnd={tooltip_hwnd}, {tw}x{th})")
+                    time.sleep(0.5)  # Esperar a que DiCloak renderice el tooltip
+                    os_click_window(tooltip_hwnd, tw // 2, th // 2)
+                    time.sleep(2)
+
+                    pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
+                    if pwd_len and int(pwd_len) > 0:
+                        log_ok(f"Password autofill DiCloak exitoso ({pwd_len} chars)")
+                    else:
+                        # Retry: re-click campo, buscar tooltip, click tooltip
+                        log_info("Reintentando autofill...")
+                        hwnds_before = get_visible_hwnds()
+                        os_click_window(browser_hwnd, client_x, client_y)
+                        time.sleep(2)
+                        tooltip_hwnd = find_new_tooltip_hwnd(hwnds_before)
+                        if tooltip_hwnd:
+                            tw, th = get_window_size(tooltip_hwnd)
+                            time.sleep(0.5)
+                            os_click_window(tooltip_hwnd, tw // 2, th // 2)
+                            time.sleep(2)
+                        pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
+                        if pwd_len and int(pwd_len) > 0:
+                            log_ok(f"Password autofill exitoso en retry ({pwd_len} chars)")
+                        else:
+                            log_warn("No se pudo activar autofill de DiCloak")
+                            return False
+                else:
+                    log_warn("No se encontró ventana del tooltip de DiCloak")
+                    return False
         else:
-            # 5. Click en tooltip de DiCloak (justo debajo del campo)
-            tooltip_y = pwd_coords["screen_bottom"] + 25
-            log_info(f"Click OS en tooltip DiCloak ({pwd_coords['screen_cx']}, {tooltip_y})")
-            os_click(pwd_coords["screen_cx"], tooltip_y)
+            # === Fallback pyautogui (mueve cursor brevemente) ===
+            log_info("pywinauto no disponible, usando pyautogui (mueve cursor)")
+            self._send_raw("Page.bringToFront")
+            time.sleep(0.5)
+
+            os_click(pwd_coords["screen_cx"], pwd_coords["screen_cy"])
             time.sleep(2)
 
             pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
-            if pwd_len and int(pwd_len) > 0:
-                log_ok(f"Password autofill DiCloak exitoso ({pwd_len} chars)")
-            else:
-                # Intentar otros offsets
-                for offset in [15, 40, 60]:
-                    os_click(pwd_coords["screen_cx"], pwd_coords["screen_bottom"] + offset)
-                    time.sleep(1.5)
-                    pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
-                    if pwd_len and int(pwd_len) > 0:
-                        log_ok(f"Password autofill exitoso (offset={offset})")
-                        break
+            if not pwd_len or int(pwd_len) == 0:
+                tooltip_y = pwd_coords["screen_bottom"] + 25
+                os_click(pwd_coords["screen_cx"], tooltip_y)
+                time.sleep(2)
+                pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
 
-                if not pwd_len or int(pwd_len) == 0:
-                    log_warn("No se pudo activar autofill de DiCloak")
-                    return False
+            if not pwd_len or int(pwd_len) == 0:
+                log_warn("No se pudo activar autofill de DiCloak")
+                return False
+            log_ok(f"Password autofill exitoso ({pwd_len} chars)")
 
-        # 6. Click en Siguiente via CDP (no necesita OS click)
+        # 3. Click en Siguiente via CDP
         clicked_next = self.evaluate("""(() => {
             const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
             const next = btns.find(b => {
@@ -358,6 +434,10 @@ class Veo3Session:
         })()""")
         if clicked_next:
             log_info(f"Click CDP en '{clicked_next}'")
+            time.sleep(4)
+            # Reconectar — Siguiente navega a otra página
+            self._ws = None
+            self.connect()
 
         return True
 
@@ -475,13 +555,43 @@ def navigate_and_stabilize(port: int, timeout: int = 60) -> dict:
         # 3. Navegar directo a Veo 3
         log_info(f"Navegando a {VEO3_URL}...")
         session.navigate(VEO3_URL)
-        time.sleep(4)
+        time.sleep(3)
+
+        # Forzar reconexión — la navegación puede romper el WebSocket
+        session._ws = None
+        session.connect()
+
+        # Esperar a que la URL se estabilice (la redirección a Google tarda)
+        for _ in range(8):
+            url_check = (session.evaluate("window.location.href") or "").lower()
+            if "accounts.google" in url_check:
+                break  # Ya redirigió al login
+            if session.is_on_flow():
+                # Verificar que realmente cargó (no es pre-redirect)
+                ready = session.evaluate("document.readyState")
+                has_content = session.evaluate("document.querySelectorAll('button').length > 3")
+                if ready == "complete" and has_content:
+                    break  # Realmente está en Flow cargado
+            time.sleep(1)
+            # Reconectar si la redirección rompió el WS
+            if not session.is_connected():
+                session.connect()
 
         # 4. Manejar login si aparece (loop hasta que estemos en Flow)
-        max_login_attempts = 3
+        max_login_attempts = 5
         for attempt in range(max_login_attempts):
+            # Reconectar si se perdió la conexión
+            if not session.is_connected():
+                session.connect()
+
+            url = (session.evaluate("window.location.href") or "").lower()
+            log_info(f"Intento {attempt + 1}/{max_login_attempts}: {url[:80]}")
+
             if session.is_on_flow():
-                break
+                # Verificar que no es pre-redirect (URL de Flow pero sin contenido real)
+                has_buttons = session.evaluate("document.querySelectorAll('button').length > 3")
+                if has_buttons:
+                    break
 
             if session.detect_google_login():
                 log_info(f"Login detectado (intento {attempt + 1}/{max_login_attempts})")
