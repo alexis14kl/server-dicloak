@@ -480,16 +480,22 @@ def open_new_project(port: int) -> dict:
             return {"success": False, "error": "No se encontró botón 'New project'"}
 
         log_ok("Click en 'New project'")
-        time.sleep(3)
 
-        # Verificar que se abrió el chat
-        url = session.evaluate("window.location.href") or ""
+        # Esperar a que la URL cambie a /project/{id}
+        project_url = ""
+        for _ in range(10):
+            time.sleep(1)
+            url = session.evaluate("window.location.href") or ""
+            if "/project/" in url:
+                project_url = url
+                break
+
         title = session.evaluate("document.title") or ""
 
         return {
             "success": True,
             "port": port,
-            "url": url,
+            "url": project_url or url,
             "title": title,
         }
 
