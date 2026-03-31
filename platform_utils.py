@@ -140,6 +140,54 @@ def _get_process_list_windows() -> list[dict]:
         return []
 
 
+def os_click(screen_x: int, screen_y: int) -> bool:
+    """Click real del SO en coordenadas absolutas de pantalla (cross-platform).
+    Necesario para activar el autofill nativo de DiCloak que no responde a clicks CDP.
+    """
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetCursorPos(int(screen_x), int(screen_y))
+            import time; time.sleep(0.1)
+            ctypes.windll.user32.mouse_event(0x02, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+            import time; time.sleep(0.05)
+            ctypes.windll.user32.mouse_event(0x04, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+            return True
+        except Exception:
+            return False
+    elif IS_MAC:
+        try:
+            # Usa Quartz (PyObjC) — disponible por defecto en macOS
+            from Quartz.CoreGraphics import (
+                CGEventCreateMouseEvent, CGEventPost, kCGHIDEventTap,
+                kCGEventLeftMouseDown, kCGEventLeftMouseUp, CGPointMake,
+            )
+            point = CGPointMake(screen_x, screen_y)
+            down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, 0)
+            up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, 0)
+            CGEventPost(kCGHIDEventTap, down)
+            import time; time.sleep(0.05)
+            CGEventPost(kCGHIDEventTap, up)
+            return True
+        except ImportError:
+            # Fallback: xdotool si está en Linux-like env
+            return _os_click_xdotool(screen_x, screen_y)
+    else:
+        return _os_click_xdotool(screen_x, screen_y)
+
+
+def _os_click_xdotool(screen_x: int, screen_y: int) -> bool:
+    """Click usando xdotool (Linux/X11)."""
+    try:
+        subprocess.run(
+            ["xdotool", "mousemove", str(screen_x), str(screen_y), "click", "1"],
+            capture_output=True, timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _get_process_list_unix() -> list[dict]:
     try:
         result = subprocess.run(

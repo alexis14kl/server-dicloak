@@ -233,6 +233,10 @@ class ImageDownloadRequest(BaseModel):
     output_dir: str = ""
     timeout: int = 300
 
+class Veo3StabilizeRequest(BaseModel):
+    port: int
+    timeout: int = 60
+
 
 # ── Auto-launch ──────────────────────────────────────────────────────────────
 
@@ -288,6 +292,7 @@ def index():
             "POST /profiles/hook",
             "POST /chatgpt/prompt",
             "POST /chatgpt/download-image",
+            "POST /veo3/stabilize",
         ],
     })
 
@@ -392,6 +397,17 @@ def chatgpt_prompt(req: PromptRequest):
     except Exception as e:
         return error_response(str(e), 500)
 
+
+@app.post("/veo3/stabilize")
+def veo3_stabilize(req: Veo3StabilizeRequest):
+    try:
+        from chat_veo3_videos.veo3_session import navigate_and_stabilize
+        result = navigate_and_stabilize(port=req.port, timeout=req.timeout)
+        if result.get("success"):
+            return success_response(data=result, message="Veo 3 estable y listo")
+        return error_response(result.get("error", "Error desconocido"), 500, details=result.get("details"))
+    except Exception as e:
+        return error_response(str(e), 500)
 
 @app.post("/chatgpt/download-image")
 def chatgpt_download_image(req: ImageDownloadRequest):
