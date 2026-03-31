@@ -144,22 +144,20 @@ class DICloakService:
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde. Verifica que este abierto.")
 
-        # Reutilizar perfil abierto si CDP activo
-        data = read_cdp_debug_info()
-        for entry in data.values():
-            if not isinstance(entry, dict):
-                continue
-            try:
-                port = int(entry.get("debugPort") or entry.get("port") or 0)
-            except (TypeError, ValueError):
-                continue
-            if port and _test_cdp_port(port):
-                return {
-                    "name": name,
-                    "debug_port": port,
-                    "ws_url": str(entry.get("webSocketUrl") or ""),
-                    "cdp_active": True,
-                }
+        # Guardar puertos que ya existen antes de abrir
+        existing_ports = set()
+        data_before = read_cdp_debug_info()
+        for entry in data_before.values():
+            if isinstance(entry, dict):
+                try:
+                    p = int(entry.get("debugPort") or 0)
+                    if p:
+                        existing_ports.add(p)
+                except (TypeError, ValueError):
+                    pass
+
+        # Re-inyectar hook (puede perderse si DiCloak recargó)
+        inject_cdp_hook(self.port)
 
         clicked = open_profile_via_cdp(name, self.port)
         if not clicked:
@@ -168,7 +166,7 @@ class DICloakService:
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
-        # Esperar a que DiCloak escriba el puerto en cdp_debug_info.json
+        # Esperar puerto NUEVO (que no existía antes)
         deadline = time.time() + min(timeout, 30)
         while time.time() < deadline:
             data = read_cdp_debug_info()
@@ -179,7 +177,7 @@ class DICloakService:
                     port = int(entry.get("debugPort") or entry.get("port") or 0)
                 except (TypeError, ValueError):
                     continue
-                if port and _test_cdp_port(port):
+                if port and port not in existing_ports and _test_cdp_port(port):
                     return {
                         "name": name,
                         "debug_port": port,
