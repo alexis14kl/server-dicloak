@@ -410,11 +410,15 @@ def veo3_stabilize(req: Veo3StabilizeRequest):
     except Exception as e:
         return error_response(str(e), 500)
 
+class Veo3NewProjectRequest(BaseModel):
+    port: int
+    prompt: str = ""
+
 @app.post("/veo3/new-project")
-def veo3_new_project(req: Veo3StabilizeRequest):
+def veo3_new_project(req: Veo3NewProjectRequest):
     try:
         from chat_veo3_videos.veo3_session import open_new_project
-        result = open_new_project(port=req.port)
+        result = open_new_project(port=req.port, prompt=req.prompt)
         if result.get("success"):
             return success_response(data=result, message="Nuevo proyecto abierto en Flow")
         return error_response(result.get("error", "Error desconocido"), 500)

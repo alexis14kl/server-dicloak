@@ -453,8 +453,8 @@ def _cleanup_tabs(port: int) -> str:
     return keep.get("webSocketDebuggerUrl", "")
 
 
-def open_new_project(port: int) -> dict:
-    """Abre un nuevo proyecto (chat) en Flow haciendo click en 'New project'."""
+def open_new_project(port: int, prompt: str = "") -> dict:
+    """Abre un nuevo proyecto (chat) en Flow y opcionalmente envía un prompt."""
     session = Veo3Session(port=port)
     if not session.connect():
         return {"success": False, "error": f"No se pudo conectar en puerto {port}"}
@@ -492,15 +492,80 @@ def open_new_project(port: int) -> dict:
 
         title = session.evaluate("document.title") or ""
 
+        # Si hay prompt, pegarlo y enviarlo
+        prompt_sent = False
+        if prompt:
+            prompt_sent = _paste_and_send_prompt(session, prompt)
+
         return {
             "success": True,
             "port": port,
             "url": project_url or url,
             "title": title,
+            "prompt_sent": prompt_sent,
         }
 
     finally:
         session.close()
+
+
+def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
+    """Pega un prompt en el chat de Flow y lo envía.
+    Usa beforeinput + execCommand + input event para que React reconozca el texto.
+    """
+    # Esperar a que el editor esté listo
+    for _ in range(10):
+        has_editor = session.evaluate("!!document.querySelector('[contenteditable=\"true\"]')")
+        if has_editor:
+            break
+        time.sleep(1)
+
+    safe_prompt = json.dumps(prompt)
+
+    # Pegar prompt con beforeinput + execCommand + input (React lo necesita)
+    pasted = session.evaluate(f"""(() => {{
+        const editor = document.querySelector('[contenteditable="true"]');
+        if (!editor) return 'NO_EDITOR';
+        editor.focus();
+        document.execCommand('selectAll');
+        document.execCommand('delete');
+
+        editor.dispatchEvent(new InputEvent('beforeinput', {{
+            bubbles: true, cancelable: true,
+            inputType: 'insertText', data: {safe_prompt},
+        }}));
+        document.execCommand('insertText', false, {safe_prompt});
+        editor.dispatchEvent(new InputEvent('input', {{
+            bubbles: true, inputType: 'insertText', data: {safe_prompt},
+        }}));
+
+        return 'OK:' + editor.innerText.length;
+    }})()""")
+
+    if not pasted or "OK" not in str(pasted):
+        log_warn(f"No se pudo pegar el prompt: {pasted}")
+        return False
+
+    log_ok(f"Prompt pegado ({pasted})")
+    time.sleep(1)
+
+    # Click en botón "Create" (arrow_forward)
+    sent = session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const createBtn = btns.find(b => (b.innerText || '').includes('arrow_forward'));
+        if (createBtn && !createBtn.disabled) {
+            createBtn.click();
+            return 'SENT';
+        }
+        return 'NO_BUTTON';
+    })()""")
+
+    if sent and "SENT" in str(sent):
+        log_ok("Prompt enviado")
+        return True
+
+    log_warn(f"No se pudo enviar el prompt: {sent}")
+    return False
 
 
 def navigate_and_stabilize(port: int, timeout: int = 60) -> dict:
