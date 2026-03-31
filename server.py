@@ -222,6 +222,12 @@ class CloseProfileRequest(BaseModel):
     name: str = ""
     id: str = ""
 
+class PromptRequest(BaseModel):
+    port: int
+    prompt: str
+    wait_response: bool = False
+    timeout: int = 120
+
 
 # ── Auto-launch ──────────────────────────────────────────────────────────────
 
@@ -275,6 +281,7 @@ def index():
             "POST /profiles/open",
             "POST /profiles/close",
             "POST /profiles/hook",
+            "POST /chatgpt/prompt",
         ],
     })
 
@@ -359,6 +366,23 @@ def inject_hook():
         return error_response("No se pudo inyectar el hook CDP", 500)
     except ConnectionError as e:
         return error_response(str(e), 503)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+@app.post("/chatgpt/prompt")
+def chatgpt_prompt(req: PromptRequest):
+    try:
+        from chat_gpt_consulta.prompt_paste import paste_and_send_prompt
+        result = paste_and_send_prompt(
+            port=req.port,
+            prompt=req.prompt,
+            wait_response=req.wait_response,
+            timeout=req.timeout,
+        )
+        if result.get("success"):
+            return success_response(data=result, message="Prompt enviado a ChatGPT")
+        return error_response(result.get("error", "Error desconocido"), 500)
     except Exception as e:
         return error_response(str(e), 500)
 
