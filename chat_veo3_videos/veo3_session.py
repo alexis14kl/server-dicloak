@@ -453,6 +453,50 @@ def _cleanup_tabs(port: int) -> str:
     return keep.get("webSocketDebuggerUrl", "")
 
 
+def open_new_project(port: int) -> dict:
+    """Abre un nuevo proyecto (chat) en Flow haciendo click en 'New project'."""
+    session = Veo3Session(port=port)
+    if not session.connect():
+        return {"success": False, "error": f"No se pudo conectar en puerto {port}"}
+
+    try:
+        # Verificar que estamos en Flow
+        if not session.is_on_flow():
+            url = session.evaluate("window.location.href") or ""
+            return {"success": False, "error": "No está en Flow", "url": url}
+
+        # Click en "New project"
+        result = session.evaluate("""(() => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            const newBtn = btns.find(b => (b.innerText || '').toLowerCase().includes('new project'));
+            if (newBtn) {
+                newBtn.click();
+                return 'CLICKED';
+            }
+            return 'NOT_FOUND';
+        })()""")
+
+        if result != "CLICKED":
+            return {"success": False, "error": "No se encontró botón 'New project'"}
+
+        log_ok("Click en 'New project'")
+        time.sleep(3)
+
+        # Verificar que se abrió el chat
+        url = session.evaluate("window.location.href") or ""
+        title = session.evaluate("document.title") or ""
+
+        return {
+            "success": True,
+            "port": port,
+            "url": url,
+            "title": title,
+        }
+
+    finally:
+        session.close()
+
+
 def navigate_and_stabilize(port: int, timeout: int = 60) -> dict:
     """
     Limpia tabs, navega a Veo 3, maneja login de Google, y retorna estable.

@@ -293,6 +293,7 @@ def index():
             "POST /chatgpt/prompt",
             "POST /chatgpt/download-image",
             "POST /veo3/stabilize",
+            "POST /veo3/new-project",
         ],
     })
 
@@ -406,6 +407,17 @@ def veo3_stabilize(req: Veo3StabilizeRequest):
         if result.get("success"):
             return success_response(data=result, message="Veo 3 estable y listo")
         return error_response(result.get("error", "Error desconocido"), 500, details=result.get("details"))
+    except Exception as e:
+        return error_response(str(e), 500)
+
+@app.post("/veo3/new-project")
+def veo3_new_project(req: Veo3StabilizeRequest):
+    try:
+        from chat_veo3_videos.veo3_session import open_new_project
+        result = open_new_project(port=req.port)
+        if result.get("success"):
+            return success_response(data=result, message="Nuevo proyecto abierto en Flow")
+        return error_response(result.get("error", "Error desconocido"), 500)
     except Exception as e:
         return error_response(str(e), 500)
 
