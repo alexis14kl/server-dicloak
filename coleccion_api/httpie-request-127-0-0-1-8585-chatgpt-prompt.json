@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "format": "httpie",
+    "version": "1.0.0",
+    "contentType": "request",
+    "schema": "https://schema.httpie.io/1.0.0.json",
+    "docs": "https://httpie.io/r/help/export-from-httpie",
+    "source": "HTTPie Desktop 2025.2.0"
+  },
+  "entry": {
+    "name": "",
+    "url": "http://127.0.0.1:8585/chatgpt/prompt",
+    "method": "POST",
+    "headers": [],
+    "queryParams": [],
+    "pathParams": [],
+    "auth": {
+      "type": "none"
+    },
+    "body": {
+      "type": "text",
+      "file": {
+        "name": ""
+      },
+      "text": {
+        "value": "  {\n    \"port\": 51197,\n    \"prompt\": \"genera una img de claude ia\"\n  }",
+        "format": "application/json"
+      },
+      "form": {
+        "isMultipart": false,
+        "fields": []
+      },
+      "graphql": {
+        "query": "",
+        "variables": ""
+      }
+    }
+  }
+}
