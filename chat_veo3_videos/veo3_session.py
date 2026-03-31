@@ -511,7 +511,8 @@ def open_new_project(port: int, prompt: str = "") -> dict:
 
 def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
     """Pega un prompt en el chat de Flow y lo envía.
-    Usa beforeinput + execCommand + input event para que React reconozca el texto.
+    Replica el método probado de ChatGPT: focus con Selection/Range,
+    clear con Backspace real, insert con Input.insertText por chunks.
     """
     # Esperar a que el editor esté listo
     for _ in range(10):
@@ -520,36 +521,72 @@ def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
             break
         time.sleep(1)
 
-    safe_prompt = json.dumps(prompt)
-
-    # Pegar prompt con beforeinput + execCommand + input (React lo necesita)
-    pasted = session.evaluate(f"""(() => {{
+    # 1. Focus con Selection/Range (como ChatGPT)
+    session.evaluate("""(() => {
         const editor = document.querySelector('[contenteditable="true"]');
-        if (!editor) return 'NO_EDITOR';
+        if (!editor) return;
         editor.focus();
-        document.execCommand('selectAll');
-        document.execCommand('delete');
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    })()""")
+    time.sleep(0.3)
 
-        editor.dispatchEvent(new InputEvent('beforeinput', {{
-            bubbles: true, cancelable: true,
-            inputType: 'insertText', data: {safe_prompt},
-        }}));
-        document.execCommand('insertText', false, {safe_prompt});
-        editor.dispatchEvent(new InputEvent('input', {{
-            bubbles: true, inputType: 'insertText', data: {safe_prompt},
-        }}));
+    # 2. Clear con selectNodeContents + Backspace real via CDP
+    session.evaluate("""(() => {
+        const editor = document.querySelector('[contenteditable="true"]');
+        editor.focus();
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    })()""")
+    session._send_raw("Input.dispatchKeyEvent", {
+        "type": "keyDown", "key": "Backspace", "code": "Backspace",
+        "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8,
+    })
+    session._send_raw("Input.dispatchKeyEvent", {
+        "type": "keyUp", "key": "Backspace", "code": "Backspace",
+        "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8,
+    })
+    time.sleep(0.3)
 
-        return 'OK:' + editor.innerText.length;
-    }})()""")
+    # 3. Focus de nuevo
+    session.evaluate("""(() => {
+        const editor = document.querySelector('[contenteditable="true"]');
+        editor.focus();
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    })()""")
+    time.sleep(0.3)
 
-    if not pasted or "OK" not in str(pasted):
-        log_warn(f"No se pudo pegar el prompt: {pasted}")
-        return False
+    # 4. Insert con Input.insertText por chunks (método de ChatGPT)
+    CHUNK_SIZE = 200
+    for i in range(0, len(prompt), CHUNK_SIZE):
+        chunk = prompt[i:i + CHUNK_SIZE]
+        session._send_raw("Input.insertText", {"text": chunk})
+        if i + CHUNK_SIZE < len(prompt):
+            time.sleep(0.05)
 
-    log_ok(f"Prompt pegado ({pasted})")
     time.sleep(1)
 
-    # Click en botón "Create" (arrow_forward)
+    # Verificar que el prompt se registró
+    content = session.evaluate("document.querySelector('[contenteditable=\"true\"]')?.innerText || ''")
+    if not content or len(content.strip()) < 5:
+        log_warn(f"Prompt no se registró en el editor: '{content}'")
+        return False
+
+    log_ok(f"Prompt pegado ({len(content.strip())} chars)")
+
+    # 5. Click en botón "Create" (arrow_forward) via CDP
     sent = session.evaluate("""(() => {
         const btns = Array.from(document.querySelectorAll('button'));
         const createBtn = btns.find(b => (b.innerText || '').includes('arrow_forward'));
