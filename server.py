@@ -168,6 +168,26 @@ class DICloakService:
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
+        # Esperar a que DiCloak escriba el puerto en cdp_debug_info.json
+        deadline = time.time() + min(timeout, 30)
+        while time.time() < deadline:
+            data = read_cdp_debug_info()
+            for entry in data.values():
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    port = int(entry.get("debugPort") or entry.get("port") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if port and _test_cdp_port(port):
+                    return {
+                        "name": name,
+                        "debug_port": port,
+                        "ws_url": str(entry.get("webSocketUrl") or ""),
+                        "cdp_active": True,
+                    }
+            time.sleep(0.5)
+
         return {
             "name": name,
             "debug_port": 0,
@@ -375,6 +395,14 @@ def main():
         print("[OK] CDP conectado y hook inyectado — listo para abrir perfiles")
     else:
         print("[WARN] No se pudo conectar CDP al iniciar — se reintentará en cada request")
+
+    # Mostrar perfiles con CDP activo
+    debug_data = read_cdp_debug_info()
+    for env_id, entry in debug_data.items():
+        if isinstance(entry, dict):
+            port = entry.get("debugPort", 0)
+            if port and _test_cdp_port(port):
+                print(f"[OK] Navegador activo — CDP puerto {port} | http://127.0.0.1:{port}/json/version")
 
     dev_mode = os.environ.get("DEV_RELOAD", "0") == "1"
     uvicorn.run(
