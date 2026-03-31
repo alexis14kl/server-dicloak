@@ -1,0 +1,351 @@
+"""
+CDP Bridge — Controla DICloak via Chrome DevTools Protocol.
+
+Se conecta al CDP de DICloak (puerto 9333) para:
+- Listar perfiles disponibles
+- Abrir/cerrar perfiles
+- Detectar puertos CDP dinámicos de ginsbrowser
+
+Mantiene conexión WebSocket persistente para evitar reconexiones lentas.
+"""
+from __future__ import annotations
+
+import json
+import re
+import socket
+import time
+import urllib.request
+from dataclasses import dataclass
+
+from core.utils.logger import log_info, log_ok, log_warn, log_error
+
+
+DEFAULT_DICLOAK_PORT = 9333
+
+
+@dataclass
+class ProfileInfo:
+    id: str
+    name: str
+    status: str = "stopped"
+    debug_port: int = 0
+    ws_url: str = ""
+    pid: int = 0
+
+
+# ── HTTP helpers ─────────────────────────────────────────────────────────────
+
+def _http_get_json(url: str, timeout: int = 5) -> dict | list:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _test_cdp_port(port: int) -> bool:
+    try:
+        data = _http_get_json(f"http://127.0.0.1:{port}/json/version", timeout=2)
+        return "webSocketDebuggerUrl" in str(data)
+    except Exception:
+        return False
+
+
+def is_dicloak_ready(port: int = DEFAULT_DICLOAK_PORT) -> bool:
+    return _test_cdp_port(port)
+
+
+def get_dicloak_targets(port: int = DEFAULT_DICLOAK_PORT) -> list[dict]:
+    try:
+        return _http_get_json(f"http://127.0.0.1:{port}/json")
+    except Exception:
+        return []
+
+
+def _get_page_ws_url(port: int = DEFAULT_DICLOAK_PORT) -> str:
+    targets = get_dicloak_targets(port)
+    for t in targets:
+        if t.get("type") == "page":
+            return t.get("webSocketDebuggerUrl", "")
+    return ""
+
+
+# ── Persistent CDP Connection ────────────────────────────────────────────────
+
+class CDPConnection:
+    """Conexión WebSocket persistente al CDP de DiCloak (9333).
+
+    Se conecta una vez al iniciar el servidor y reutiliza la conexión
+    para todas las evaluaciones de JavaScript. Sin reconexiones, sin
+    ThreadPoolExecutor, sin asyncio.run() por cada llamada.
+    """
+
+    def __init__(self, port: int = DEFAULT_DICLOAK_PORT):
+        self.port = port
+        self._ws = None
+        self._msg_id = 0
+        self._ws_url = ""
+
+    def connect(self) -> bool:
+        """Conecta al WebSocket del CDP de DiCloak."""
+        try:
+            import websockets.sync.client as ws_sync
+        except ImportError:
+            import subprocess, sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
+            import websockets.sync.client as ws_sync
+
+        self._ws_url = _get_page_ws_url(self.port)
+        if not self._ws_url:
+            log_warn(f"No se encontró WebSocket URL en puerto {self.port}")
+            return False
+
+        try:
+            self._ws = ws_sync.connect(self._ws_url, max_size=2**22)
+            log_ok(f"CDP conectado: {self._ws_url[:60]}")
+            return True
+        except Exception as e:
+            log_warn(f"Error conectando CDP WebSocket: {e}")
+            self._ws = None
+            return False
+
+    def is_connected(self) -> bool:
+        if self._ws is None:
+            return False
+        try:
+            self._ws.ping()
+            return True
+        except Exception:
+            self._ws = None
+            return False
+
+    def _ensure_connected(self) -> bool:
+        if self.is_connected():
+            return True
+        return self.connect()
+
+    def evaluate(self, expression: str, timeout: int = 8) -> str | None:
+        """Evalúa JS en DiCloak. Usa la conexión persistente."""
+        if not self._ensure_connected():
+            return None
+
+        self._msg_id += 1
+        msg = json.dumps({
+            "id": self._msg_id,
+            "method": "Runtime.evaluate",
+            "params": {"expression": expression, "returnByValue": True}
+        })
+
+        try:
+            self._ws.send(msg)
+            resp_raw = self._ws.recv(timeout=timeout)
+            data = json.loads(resp_raw)
+            result = data.get("result", {}).get("result", {})
+            return result.get("value", json.dumps(result))
+        except Exception as e:
+            log_warn(f"CDP evaluate error: {e}")
+            self._ws = None
+            return None
+
+    def close(self):
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+
+# Conexión global — se inicializa al arrancar el servidor
+_cdp: CDPConnection | None = None
+
+
+def get_cdp(port: int = DEFAULT_DICLOAK_PORT) -> CDPConnection:
+    """Obtiene la conexión CDP global, creándola si no existe."""
+    global _cdp
+    if _cdp is None or _cdp.port != port:
+        _cdp = CDPConnection(port)
+    return _cdp
+
+
+def init_cdp(port: int = DEFAULT_DICLOAK_PORT) -> bool:
+    """Inicializa la conexión CDP y el hook al arrancar el servidor."""
+    cdp = get_cdp(port)
+    if not cdp.connect():
+        return False
+
+    # Inyectar hook CDP de una vez
+    ok = inject_cdp_hook(port)
+    if ok:
+        log_ok("Hook CDP inyectado al iniciar servidor")
+    else:
+        log_warn("No se pudo inyectar hook CDP al iniciar")
+
+    return True
+
+
+# ── Funciones de compatibilidad (usan conexión persistente) ──────────────────
+
+def cdp_evaluate_sync(expression: str, port: int = DEFAULT_DICLOAK_PORT, timeout: int = 8) -> str | None:
+    """Evalúa JS usando la conexión persistente."""
+    return get_cdp(port).evaluate(expression, timeout)
+
+
+# ── Profile Operations via CDP ───────────────────────────────────────────────
+
+def list_profiles_via_cdp(port: int = DEFAULT_DICLOAK_PORT) -> list[ProfileInfo]:
+    js = """(() => {
+        try {
+            const rows = document.querySelectorAll('.el-table__row');
+            const profiles = [];
+            rows.forEach(row => {
+                const cells = Array.from(row.querySelectorAll('td .cell'));
+                const serial = (cells[1]?.innerText || '').trim();
+                const name = (cells[2]?.innerText || '').trim();
+                const group = (cells[3]?.innerText || '').trim();
+                if (name && name.length > 1) {
+                    profiles.push({ id: serial, name, status: group });
+                }
+            });
+            return JSON.stringify(profiles);
+        } catch(e) {
+            return JSON.stringify({error: e.message});
+        }
+    })()"""
+
+    result = cdp_evaluate_sync(js, port)
+    if not result:
+        return []
+    try:
+        items = json.loads(result)
+        return [ProfileInfo(id=p.get("id", ""), name=p["name"], status=p.get("status", "")) for p in items if p.get("name")]
+    except Exception:
+        return []
+
+
+HOOK_JS = r"""(() => {
+    if (window.__CDP_HOOK_INSTALLED__) return 'ALREADY_INSTALLED';
+    window.__CDP_HOOK_INSTALLED__ = true;
+
+    const { ipcRenderer } = require('electron');
+
+    const _origInvoke = ipcRenderer.invoke.bind(ipcRenderer);
+    ipcRenderer.invoke = function(channel, ...args) {
+        for (const arg of args) {
+            if (arg && typeof arg === 'object') {
+                const force = (o) => {
+                    if (!o || typeof o !== 'object') return;
+                    if ('canIuseCdp' in o) o.canIuseCdp = true;
+                    if (o.openParams && 'canIuseCdp' in o.openParams) o.openParams.canIuseCdp = true;
+                    Object.values(o).forEach(v => { if (v && typeof v === 'object' && v !== o) force(v); });
+                };
+                force(arg);
+            }
+        }
+        return _origInvoke(channel, ...args);
+    };
+
+    const _origSend = ipcRenderer.send.bind(ipcRenderer);
+    ipcRenderer.send = function(channel, ...args) {
+        for (const arg of args) {
+            if (arg && typeof arg === 'object') {
+                const force = (o) => {
+                    if (!o || typeof o !== 'object') return;
+                    if ('canIuseCdp' in o) o.canIuseCdp = true;
+                    Object.values(o).forEach(v => { if (v && typeof v === 'object' && v !== o) force(v); });
+                };
+                force(arg);
+            }
+        }
+        return _origSend(channel, ...args);
+    };
+
+    return 'HOOK_INSTALLED';
+})()"""
+
+
+def inject_cdp_hook(port: int = DEFAULT_DICLOAK_PORT) -> bool:
+    result = cdp_evaluate_sync(HOOK_JS, port)
+    return result is not None and "INSTALLED" in str(result).upper()
+
+
+def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) -> bool:
+    """Abre un perfil en DiCloak con un solo evaluate (hook ya inyectado al inicio)."""
+    safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
+
+    # Un solo JS que busca y hace click — sin inyectar hook (ya se hizo al iniciar)
+    open_js = f"""(() => {{
+        try {{
+            const targetName = "{safe_name}".toLowerCase().trim();
+            const rows = document.querySelectorAll('.el-table__row');
+            let targetRow = null;
+
+            for (const row of rows) {{
+                const cells = Array.from(row.querySelectorAll('td .cell'));
+                const nameCell = (cells[2]?.innerText || '').trim();
+                if (nameCell.toLowerCase() === targetName || nameCell.toLowerCase().includes(targetName) || targetName.includes(nameCell.toLowerCase())) {{
+                    targetRow = row;
+                    break;
+                }}
+            }}
+
+            if (!targetRow) {{
+                return 'PROFILE_NOT_FOUND';
+            }}
+
+            const buttons = Array.from(targetRow.querySelectorAll('button, a, [role="button"], .el-button'));
+            const openBtn = buttons.find(b => {{
+                const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+                return text === 'abrir' || text === 'open' || text === 'launch' || text === 'iniciar';
+            }});
+
+            if (openBtn) {{
+                openBtn.click();
+                return 'CLICKED_OPEN';
+            }}
+
+            const fallbackBtn = buttons.find(b => {{
+                const text = (b.innerText || '').trim().toLowerCase();
+                return text !== '' && text !== 'select' && !b.querySelector('input[type="checkbox"]');
+            }});
+
+            if (fallbackBtn) {{
+                fallbackBtn.click();
+                return 'CLICKED_FALLBACK';
+            }}
+
+            return 'NO_OPEN_BUTTON';
+        }} catch(e) {{
+            return 'ERROR: ' + e.message;
+        }}
+    }})()"""
+
+    result = cdp_evaluate_sync(open_js, port, timeout=5)
+    log_info(f"open_profile result: {result}")
+
+    if result and "CLICKED" in str(result):
+        log_ok(f"Perfil '{profile_name}' abierto via CDP")
+        return True
+
+    log_warn(f"No se pudo abrir perfil '{profile_name}': {result}")
+    return False
+
+
+def detect_ginsbrowser_port(timeout_sec: int = 60) -> int:
+    """Detecta el puerto CDP del navegador ginsbrowser via cdp_debug_info.json."""
+    from core.cfg.platform import read_cdp_debug_info
+
+    deadline = time.time() + timeout_sec
+
+    while time.time() < deadline:
+        data = read_cdp_debug_info()
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                port = int(entry.get("debugPort") or entry.get("port") or 0)
+            except (TypeError, ValueError):
+                continue
+            if port and _test_cdp_port(port):
+                return port
+
+        time.sleep(0.5)
+
+    return 0
