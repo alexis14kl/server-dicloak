@@ -252,6 +252,7 @@ def index():
         "endpoints": [
             "GET  /health",
             "GET  /profiles",
+            "GET  /profiles/search/{name}",
             "GET  /profiles/running",
             "POST /profiles/open",
             "POST /profiles/close",
@@ -265,6 +266,24 @@ def health():
         data = service.check_health()
         status = "ok" if data["dicloak_ready"] else "dicloak_not_found"
         return success_response(data=data, message=status)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+@app.get("/profiles/search/{name}")
+def search_profile(name: str):
+    try:
+        profiles = service.get_profiles()
+        target = name.lower().strip()
+        matches = [p for p in profiles if target in p["name"].lower() or p["name"].lower() in target]
+        if matches:
+            return success_response(
+                data={"count": len(matches), "profiles": matches},
+                message=f"{len(matches)} perfil(es) encontrado(s)",
+            )
+        return error_response(f"Perfil '{name}' no encontrado", 404,
+                              details={"available": [p["name"] for p in profiles]})
+    except ConnectionError as e:
+        return error_response(str(e), 503)
     except Exception as e:
         return error_response(str(e), 500)
 
