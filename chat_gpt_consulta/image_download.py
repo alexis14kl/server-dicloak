@@ -41,14 +41,12 @@ def _build_filename(source_url: str) -> str:
 def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
     """Espera que ChatGPT genere la imagen y retorna la URL.
 
-    Busca en los últimos 2 turns de la conversación:
-    - Botón de "Descargar esta imagen"
-    - Overlay de generación de imagen
-    - Texto "Imagen creada" / "Image created"
-    - URL con /backend-api/estuary/content
+    Espera a que ChatGPT termine completamente de generar (stop button desaparece),
+    luego espera a que la imagen final de alta resolución se cargue.
     """
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
+    generation_done = False
 
     while time.time() < deadline:
         result = session.evaluate("""(() => {
@@ -62,7 +60,14 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
                 return JSON.stringify({status: 'COMPARISON_RESOLVED'});
             }
 
-            // Buscar en los últimos 2 turns
+            // Verificar si todavía está generando
+            const stop = document.querySelector('button[data-testid="stop-button"]')
+                || document.querySelector('button[aria-label="Stop generating"]');
+            if (stop) {
+                return JSON.stringify({status: 'GENERATING'});
+            }
+
+            // Generación terminada — buscar imagen final
             const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
             const messages = Array.from(document.querySelectorAll('[data-message-id]'));
             const articles = Array.from(document.querySelectorAll('article'));
@@ -70,7 +75,6 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
             const candidates = allBlocks.slice(-2).reverse();
 
             for (const block of candidates) {
-                // Verificar si tiene botón de descarga o overlay
                 const hasDownload = Array.from(block.querySelectorAll('button,[role="button"],a'))
                     .some(el => /descargar esta imagen|download this image/i.test(
                         (el.innerText || el.getAttribute('aria-label') || '').trim()
@@ -84,16 +88,10 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
                         .map(img => img.currentSrc || img.src || '')
                         .filter(src => src.includes('/backend-api/estuary/content'));
                     if (urls.length > 0) {
+                        // Tomar la última URL (imagen final de mayor resolución)
                         return JSON.stringify({status: 'FOUND', url: urls[urls.length - 1]});
                     }
                 }
-            }
-
-            // Verificar si todavía está generando
-            const stop = document.querySelector('button[data-testid="stop-button"]')
-                || document.querySelector('button[aria-label="Stop generating"]');
-            if (stop) {
-                return JSON.stringify({status: 'GENERATING'});
             }
 
             return JSON.stringify({status: 'WAITING'});
@@ -111,15 +109,24 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
 
         status = info.get("status", "")
 
-        if status == "FOUND":
-            url = info.get("url", "")
-            log_ok(f"Imagen encontrada: {url[:80]}...")
-            return url
+        if status == "GENERATING":
+            time.sleep(2)
+            continue
         elif status == "COMPARISON_RESOLVED":
             log_info("Comparación de imágenes resuelta, esperando URL...")
             time.sleep(2)
-        elif status == "GENERATING":
-            time.sleep(2)
+            continue
+        elif status == "FOUND":
+            if not generation_done:
+                # Primera vez que detectamos la imagen — esperar a que se cargue
+                # la versión final de alta resolución
+                generation_done = True
+                log_info("Imagen detectada. Esperando 5s para version final de alta resolucion...")
+                time.sleep(5)
+                continue  # Volver a buscar para obtener la URL actualizada
+            url = info.get("url", "")
+            log_ok(f"Imagen final encontrada: {url[:80]}...")
+            return url
         else:
             time.sleep(2)
 
@@ -127,8 +134,87 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
     return ""
 
 
+def _get_cookies_via_cdp(session: ChatGPTSession) -> str:
+    """Extrae cookies de la sesion del navegador via CDP para usar en Python."""
+    result = session.evaluate("""(() => document.cookie)()""")
+    return result or ""
+
+
+def _download_with_python(image_url: str, cookies: str, output_path: Path) -> bool:
+    """Descarga la imagen directamente desde Python con las cookies del navegador.
+    Evita el limite de 4MB del WebSocket CDP.
+    """
+    import urllib.request
+
+    req = urllib.request.Request(image_url)
+    req.add_header("Cookie", cookies)
+    req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+            if len(data) < 1000:
+                log_warn(f"Imagen muy pequeña ({len(data)} bytes)")
+                return False
+            output_path.write_bytes(data)
+            log_ok(f"Imagen descargada via Python: {output_path} ({len(data)} bytes)")
+            return True
+    except Exception as e:
+        log_warn(f"Descarga Python fallo: {e}")
+        return False
+
+
+def _download_with_cdp(session: ChatGPTSession, image_url: str, output_path: Path) -> bool:
+    """Descarga la imagen via fetch() en el navegador (funciona para imagenes < 3MB)."""
+    safe_url = image_url.replace("'", "\\'")
+
+    result = session.evaluate(f"""(async () => {{
+        try {{
+            const resp = await fetch('{safe_url}');
+            if (!resp.ok) return JSON.stringify({{error: 'HTTP ' + resp.status}});
+            const blob = await resp.blob();
+            const reader = new FileReader();
+            return await new Promise((resolve) => {{
+                reader.onload = () => resolve(JSON.stringify({{
+                    base64: reader.result.split(',')[1],
+                    size: blob.size,
+                    type: blob.type,
+                }}));
+                reader.readAsDataURL(blob);
+            }});
+        }} catch(e) {{
+            return JSON.stringify({{error: e.message}});
+        }}
+    }})()""", timeout=60, await_promise=True)
+
+    if not result:
+        return False
+
+    try:
+        data = json.loads(result)
+    except Exception:
+        return False
+
+    if data.get("error"):
+        log_warn(f"CDP download error: {data['error']}")
+        return False
+
+    b64 = data.get("base64", "")
+    if not b64 or data.get("size", 0) < 1000:
+        return False
+
+    image_bytes = base64.b64decode(b64)
+    output_path.write_bytes(image_bytes)
+    log_ok(f"Imagen descargada via CDP: {output_path} ({len(image_bytes)} bytes)")
+    return True
+
+
 def download_image(session: ChatGPTSession, image_url: str, output_dir: str = "") -> str:
-    """Descarga la imagen usando fetch() dentro del navegador (con cookies).
+    """Descarga la imagen generada por ChatGPT.
+
+    Estrategia:
+    1. Intenta descargar via Python directo (sin limite de tamaño)
+    2. Fallback a CDP fetch (para imagenes pequeñas)
 
     Returns: ruta del archivo descargado o "" si falla.
     """
@@ -137,59 +223,19 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
     filename = _build_filename(image_url)
     output_path = out_dir / filename
 
-    safe_url = image_url.replace("'", "\\'")
-
-    # Descargar con fetch() dentro del navegador y convertir a base64
     for attempt in range(3):
         log_info(f"Descargando imagen (intento {attempt + 1}/3)...")
 
-        result = session.evaluate(f"""(async () => {{
-            try {{
-                const resp = await fetch('{safe_url}');
-                if (!resp.ok) return JSON.stringify({{error: 'HTTP ' + resp.status}});
-                const blob = await resp.blob();
-                const reader = new FileReader();
-                return await new Promise((resolve) => {{
-                    reader.onload = () => resolve(JSON.stringify({{
-                        base64: reader.result.split(',')[1],
-                        size: blob.size,
-                        type: blob.type,
-                    }}));
-                    reader.readAsDataURL(blob);
-                }});
-            }} catch(e) {{
-                return JSON.stringify({{error: e.message}});
-            }}
-        }})()""", timeout=60, await_promise=True)
+        # Estrategia 1: Python directo con cookies del navegador
+        cookies = _get_cookies_via_cdp(session)
+        if cookies and _download_with_python(image_url, cookies, output_path):
+            return str(output_path)
 
-        if not result:
-            time.sleep(3)
-            continue
+        # Estrategia 2: CDP fetch (funciona si < 4MB)
+        if _download_with_cdp(session, image_url, output_path):
+            return str(output_path)
 
-        try:
-            data = json.loads(result)
-        except Exception:
-            time.sleep(3)
-            continue
-
-        if data.get("error"):
-            log_warn(f"Error descargando: {data['error']}")
-            time.sleep(3)
-            continue
-
-        b64 = data.get("base64", "")
-        size = data.get("size", 0)
-
-        if not b64 or size < 1000:
-            log_warn(f"Imagen muy pequeña ({size} bytes)")
-            time.sleep(3)
-            continue
-
-        # Guardar archivo
-        image_bytes = base64.b64decode(b64)
-        output_path.write_bytes(image_bytes)
-        log_ok(f"Imagen descargada: {output_path} ({len(image_bytes)} bytes)")
-        return str(output_path)
+        time.sleep(3)
 
     log_error("No se pudo descargar la imagen después de 3 intentos")
     return ""
