@@ -21,7 +21,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -63,12 +65,15 @@ from platform_utils import (
     get_process_list,
     get_browser_process_name,
     read_cdp_debug_info,
+    write_cdp_debug_info,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 SERVER_PORT = int(os.environ.get("DICLOAK_API_PORT", "0") or "0") or 8585
 DICLOAK_PORT = int(os.environ.get("CDP_DICLOAK_PORT", "0") or "0") or DEFAULT_DICLOAK_PORT
+IMAGES_DIR = PROJECT_ROOT / "output" / "images"
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Response helpers ──────────────────────────────────────────────────────────
 
@@ -144,17 +149,8 @@ class DICloakService:
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde. Verifica que este abierto.")
 
-        # Guardar puertos que ya existen antes de abrir
-        existing_ports = set()
-        data_before = read_cdp_debug_info()
-        for entry in data_before.values():
-            if isinstance(entry, dict):
-                try:
-                    p = int(entry.get("debugPort") or 0)
-                    if p:
-                        existing_ports.add(p)
-                except (TypeError, ValueError):
-                    pass
+        # Vaciar cdp_debug_info.json para detectar cualquier puerto nuevo
+        write_cdp_debug_info({})
 
         # Re-inyectar hook (puede perderse si DiCloak recargó)
         inject_cdp_hook(self.port)
@@ -166,7 +162,7 @@ class DICloakService:
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
-        # Esperar puerto NUEVO (que no existía antes)
+        # Esperar a que aparezca un puerto CDP activo en el archivo
         deadline = time.time() + min(timeout, 30)
         while time.time() < deadline:
             data = read_cdp_debug_info()
@@ -177,7 +173,7 @@ class DICloakService:
                     port = int(entry.get("debugPort") or entry.get("port") or 0)
                 except (TypeError, ValueError):
                     continue
-                if port and port not in existing_ports and _test_cdp_port(port):
+                if port and _test_cdp_port(port):
                     return {
                         "name": name,
                         "debug_port": port,
@@ -202,6 +198,9 @@ class DICloakService:
             else:
                 subprocess.run(["pkill", "-f", "ginsbrowser"],
                                capture_output=True, timeout=5)
+            # Limpiar cdp_debug_info para que no queden puertos fantasma
+            from platform_utils import write_cdp_debug_info
+            write_cdp_debug_info({})
             return 1
         except Exception:
             return 0
@@ -240,6 +239,8 @@ class ImageDownloadRequest(BaseModel):
     port: int
     output_dir: str = ""
     timeout: int = 300
+    webhook_url: str = ""
+    job_id: str = ""
 
 class Veo3StabilizeRequest(BaseModel):
     port: int
@@ -284,8 +285,13 @@ def ensure_dicloak_running(port: int = DEFAULT_DICLOAK_PORT, timeout: int = 20) 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+from fastapi.staticfiles import StaticFiles
+
 app = FastAPI(title="DICloak Control API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Servir imágenes descargadas via /files/images/
+app.mount("/files/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 
 service = DICloakService(DICLOAK_PORT)
 
@@ -468,12 +474,18 @@ def veo3_download_video(req: Veo3DownloadVideoRequest):
 def chatgpt_download_image(req: ImageDownloadRequest):
     try:
         from chat_gpt_consulta.image_download import wait_and_download_image
+        # Siempre guardar en el directorio propio del servidor
         result = wait_and_download_image(
             port=req.port,
-            output_dir=req.output_dir,
+            output_dir=str(IMAGES_DIR),
             timeout=req.timeout,
         )
         if result.get("success"):
+            # Agregar URL HTTP servible por este servidor
+            file_name = result.get("file_name", "")
+            if file_name:
+                result["image_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/images/{file_name}"
+            _notify_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Imagen descargada")
         return error_response(result.get("error", "Error desconocido"), 500)
     except Exception as e:
@@ -506,6 +518,32 @@ def veo3_download_video(req: Veo3DownloadVideoRequest):
         return error_response(str(e), 500)
 
 
+def _notify_webhook(url: str, job_id: str, result: dict) -> None:
+    """Fire-and-forget: notifica al webhook sin bloquear el response."""
+    if not url:
+        return
+
+    def _send():
+        try:
+            payload = _json.dumps({
+                "job_id": job_id,
+                "event": "image_ready",
+                "file_path": result.get("file_path", ""),
+                "file_name": result.get("file_name", ""),
+                "file_size": result.get("file_size", 0),
+                "image_url": result.get("image_url", ""),
+            }, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"[WARN] Webhook fallo ({url}): {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -524,6 +562,10 @@ def main():
     print(f"================================")
 
     ensure_dicloak_running(dicloak_port)
+
+    # Limpiar estado de sesiones anteriores
+    write_cdp_debug_info({})
+    print("[OK] cdp_debug_info limpiado")
 
     # Esperar a que DiCloak cargue su página
     for _ in range(15):
