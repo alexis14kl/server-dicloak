@@ -227,6 +227,7 @@ class PromptRequest(BaseModel):
     prompt: str
     wait_response: bool = False
     timeout: int = 120
+    auto_rotate: bool = True
 
     @field_validator("prompt")
     @classmethod
@@ -398,16 +399,25 @@ def inject_hook():
 @app.post("/chatgpt/prompt")
 def chatgpt_prompt(req: PromptRequest):
     try:
-        from chat_gpt_consulta.prompt_paste import paste_and_send_prompt
-        result = paste_and_send_prompt(
-            port=req.port,
-            prompt=req.prompt,
-            wait_response=req.wait_response,
-            timeout=req.timeout,
-        )
+        if req.auto_rotate:
+            from chat_gpt_consulta.prompt_paste import paste_and_send_with_rotation
+            result = paste_and_send_with_rotation(
+                port=req.port,
+                prompt=req.prompt,
+                wait_response=req.wait_response,
+                timeout=req.timeout,
+            )
+        else:
+            from chat_gpt_consulta.prompt_paste import paste_and_send_prompt
+            result = paste_and_send_prompt(
+                port=req.port,
+                prompt=req.prompt,
+                wait_response=req.wait_response,
+                timeout=req.timeout,
+            )
         if result.get("success"):
             return success_response(data=result, message="Prompt enviado a ChatGPT")
-        return error_response(result.get("error", "Error desconocido"), 500)
+        return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 

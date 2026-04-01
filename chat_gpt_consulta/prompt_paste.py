@@ -17,6 +17,9 @@ from typing import Optional
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error
+from chat_gpt_consulta.account_state import (
+    get_exhausted_ids, mark_exhausted, clear_exhausted,
+)
 
 
 @dataclass
@@ -224,11 +227,11 @@ class ChatGPTSession:
             return (editor?.innerText || '').trim().substring(0, 100);
         }})()""") or ""
 
-        if len(text) > 10:
+        if len(text) >= min(len(prompt), 3):
             log_ok(f"Prompt pegado ({len(prompt)} chars)")
             return True
 
-        log_warn("El prompt no se registró en el editor")
+        log_warn(f"El prompt no se registró en el editor (esperado >= {min(len(prompt), 3)}, obtuvo {len(text)})")
         return False
 
     def send_prompt(self) -> bool:
@@ -310,6 +313,176 @@ class ChatGPTSession:
         })()""")
         return str(result or "")
 
+    # ── Detección de tokens y sesión ─────────────────────────────────────
+
+    def detect_token_status(self, timeout_sec: int = 90) -> str:
+        """Espera la respuesta y detecta si hay error de tokens o sesión.
+        Retorna: 'success', 'no_image_tokens', 'session_expired'
+        """
+        deadline = time.time() + timeout_sec
+        idle_cycles = 0
+        time.sleep(3)
+
+        while time.time() < deadline:
+            # Detectar tokens agotados
+            no_tokens = self.evaluate("""(() => {
+                const text = (document.body?.innerText || '').toLowerCase()
+                    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+                const phrases = [
+                    'has alcanzado tu limite de creacion de imagenes',
+                    'el limite se restablece',
+                    'youve hit the team plan limit for image generations',
+                    'you can create more images when the limit resets',
+                    'no pude invocar la herramienta de generacion de imagenes',
+                    'cannot generate more images',
+                    'image generation limit',
+                ];
+                return phrases.some(p => text.includes(p)) ? 'YES' : 'NO';
+            })()""")
+            if no_tokens == "YES":
+                log_warn("Tokens de imagen agotados detectados")
+                return "no_image_tokens"
+
+            # Detectar sesión expirada
+            expired = self.evaluate("""(() => {
+                const text = (document.body?.innerText || '').toLowerCase()
+                    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+                const phrases = [
+                    'tu sesion ha caducado',
+                    'vuelve a iniciar sesion',
+                    'your session has expired',
+                    'sign in again to continue',
+                    'session expired',
+                ];
+                const hasDialog = !!document.querySelector('[role="dialog"]');
+                return (hasDialog && phrases.some(p => text.includes(p))) ? 'YES' : 'NO';
+            })()""")
+            if expired == "YES":
+                log_warn("Sesión expirada detectada")
+                return "session_expired"
+
+            # Verificar si sigue generando
+            generating = self.evaluate("""(() => {
+                const stop = document.querySelector('button[data-testid="stop-button"]')
+                    || document.querySelector('button[aria-label="Stop generating"]');
+                const progress = document.querySelector('[role="progressbar"]');
+                const body = (document.body?.innerText || '').toLowerCase();
+                const creating = body.includes('creando imagen') || body.includes('creating image');
+                return (stop || progress || creating) ? 'YES' : 'NO';
+            })()""")
+
+            if generating == "YES":
+                idle_cycles = 0
+            else:
+                idle_cycles += 1
+                if idle_cycles >= 5:
+                    return "success"
+
+            time.sleep(1)
+
+        return "success"
+
+    # ── Rotación de cuentas ──────────────────────────────────────────────
+
+    def switch_account(self, exhausted_ids: set[str]) -> dict:
+        """Abre menú de perfil, lista cuentas, click en una no agotada.
+        Retorna dict con switched, account_id, account_label, available_count.
+        """
+        # 1. Click en botón de perfil
+        clicked = self.evaluate("""(() => {
+            const btn = document.querySelector('[data-testid="accounts-profile-button"]');
+            if (btn) { btn.click(); return 'CLICKED'; }
+            return 'NO_BUTTON';
+        })()""")
+        if clicked != "CLICKED":
+            log_warn("No se encontró botón de perfil")
+            return {"switched": False, "reason": "no_profile_button"}
+
+        time.sleep(2)
+
+        # 2. Esperar menú
+        menu_ready = self.evaluate("""(() => {
+            return !!document.querySelector('[role="menu"]') ? 'YES' : 'NO';
+        })()""")
+        if menu_ready != "YES":
+            log_warn("Menú de perfil no apareció")
+            return {"switched": False, "reason": "menu_not_found"}
+
+        # 3. Listar cuentas
+        exhausted_json = json.dumps(list(exhausted_ids))
+        accounts_raw = self.evaluate(f"""(() => {{
+            const exhausted = {exhausted_json};
+            const items = Array.from(document.querySelectorAll('[role="menuitemradio"]'));
+            const profileBtn = document.querySelector('[data-testid="accounts-profile-button"]');
+            const currentText = (profileBtn?.innerText || '').trim().toLowerCase();
+
+            const accounts = items.map((el, i) => {{
+                const text = (el.innerText || '').trim();
+                const normalized = text.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+                const accountId = 'slot:' + i + '|label:' + (normalized || 'sin_texto');
+                const ariaChecked = el.getAttribute('aria-checked') === 'true';
+                const hasCheckmark = !!el.querySelector('.trailing svg.icon-sm');
+                const looksCurrent = ariaChecked || hasCheckmark
+                    || currentText.includes(normalized.substring(0, 10));
+                const excluded = exhausted.includes(accountId);
+                return {{index: i, accountId, label: text, looksCurrent, excluded}};
+            }});
+
+            const available = accounts.filter(a => !a.looksCurrent);
+            const candidates = available.filter(a => !a.excluded);
+            return JSON.stringify({{accounts, available: available.length, candidates}});
+        }})()""")
+
+        if not accounts_raw:
+            return {"switched": False, "reason": "no_accounts_data"}
+
+        try:
+            data = json.loads(accounts_raw)
+        except Exception:
+            return {"switched": False, "reason": "parse_error"}
+
+        candidates = data.get("candidates", [])
+        available_count = data.get("available", 0)
+
+        if not candidates:
+            log_warn(f"Sin cuentas disponibles (total disponibles: {available_count})")
+            return {"switched": False, "available_count": available_count, "reason": "no_candidates"}
+
+        # 4. Click en primera candidata
+        chosen = candidates[0]
+        chosen_idx = chosen["index"]
+        log_info(f"Cambiando a cuenta: {chosen['label']} (index={chosen_idx})")
+
+        self.evaluate(f"""(() => {{
+            const items = document.querySelectorAll('[role="menuitemradio"]');
+            if (items[{chosen_idx}]) items[{chosen_idx}].click();
+        }})()""")
+
+        # 5. Esperar recarga (cambio de cuenta causa navegación)
+        time.sleep(5)
+
+        # 6. Reconectar WebSocket
+        self._ws = None
+        self.connect()
+
+        # 7. Navegar a chat limpio
+        self.evaluate("window.location.href = 'https://chatgpt.com/'")
+        time.sleep(4)
+        self._ws = None
+        self.connect()
+
+        # 8. Esperar editor ready
+        self.wait_for_page_ready(timeout_sec=15)
+
+        log_ok(f"Cuenta cambiada a: {chosen['label']}")
+        return {
+            "switched": True,
+            "account_id": chosen["accountId"],
+            "account_label": chosen["label"],
+            "available_count": available_count,
+            "reason": "account_switched",
+        }
+
 
 # ── Función principal ────────────────────────────────────────────────────────
 
@@ -361,6 +534,107 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True, ti
                 result["response_complete"] = False
 
         return result
+
+    finally:
+        session.close()
+
+
+MAX_ROTATION_ATTEMPTS = 20
+
+
+def paste_and_send_with_rotation(
+    port: int, prompt: str, wait_response: bool = True, timeout: int = 120,
+) -> dict:
+    """
+    Pega y envía prompt con rotación automática de cuentas.
+
+    Si ChatGPT responde 'sin tokens de imagen', cambia a otra cuenta
+    dentro de ChatGPT y reintenta. Hasta 20 intentos.
+
+    Si 'sesión expirada', retorna error para que el caller cambie perfil DiCloak.
+    """
+    session = ChatGPTSession(port=port)
+    if not session.connect():
+        return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+
+    last_account_id = ""
+    last_account_label = ""
+    rotations = 0
+
+    try:
+        for attempt in range(MAX_ROTATION_ATTEMPTS):
+            log_info(f"Intento {attempt + 1}/{MAX_ROTATION_ATTEMPTS}")
+
+            # Esperar página lista
+            if not session.wait_for_page_ready(timeout_sec=30):
+                return {"success": False, "error": "ChatGPT no cargó completamente"}
+
+            # Pegar prompt
+            if not session.paste_prompt(prompt):
+                return {"success": False, "error": "No se pudo pegar el prompt"}
+
+            # Enviar
+            if not session.send_prompt():
+                return {"success": False, "error": "No se pudo enviar el prompt"}
+
+            # Detectar estado de tokens
+            status = session.detect_token_status(timeout_sec=timeout)
+
+            if status == "success":
+                # Limpiar cuenta previa si funcionó
+                if last_account_id:
+                    clear_exhausted(port, last_account_id)
+
+                result = {
+                    "success": True,
+                    "port": port,
+                    "prompt_length": len(prompt),
+                    "sent": True,
+                    "rotations": rotations,
+                }
+                if wait_response:
+                    result["response"] = session.get_last_response()
+                    result["response_complete"] = True
+                return result
+
+            if status == "session_expired":
+                return {
+                    "success": False,
+                    "error": "session_expired",
+                    "message": "La sesión de ChatGPT expiró. Cambiar perfil DiCloak.",
+                    "rotations": rotations,
+                }
+
+            # no_image_tokens → marcar cuenta y rotar
+            if last_account_id:
+                mark_exhausted(port, last_account_id, last_account_label)
+                log_info(f"Cuenta agotada marcada: {last_account_label or last_account_id}")
+
+            log_info("Tokens agotados. Rotando cuenta...")
+            exhausted = get_exhausted_ids(port)
+            switch_result = session.switch_account(exhausted)
+
+            if not switch_result.get("switched"):
+                reason = switch_result.get("reason", "unknown")
+                return {
+                    "success": False,
+                    "error": "all_accounts_exhausted",
+                    "message": f"Sin cuentas disponibles: {reason}",
+                    "rotations": rotations,
+                }
+
+            last_account_id = switch_result.get("account_id", "")
+            last_account_label = switch_result.get("account_label", "")
+            rotations += 1
+            log_ok(f"Rotación #{rotations}: {last_account_label}")
+            time.sleep(2)
+
+        return {
+            "success": False,
+            "error": "max_rotation_attempts",
+            "message": f"Se agotaron los {MAX_ROTATION_ATTEMPTS} intentos de rotación",
+            "rotations": rotations,
+        }
 
     finally:
         session.close()
