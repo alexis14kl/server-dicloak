@@ -46,7 +46,6 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
     """
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
-    generation_done = False
 
     while time.time() < deadline:
         result = session.evaluate("""(() => {
@@ -83,13 +82,18 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
                 const hasCreatedText = /imagen creada|image created/i.test(block.innerText || '');
 
                 if (hasDownload || hasOverlay || hasCreatedText) {
-                    const imgs = Array.from(block.querySelectorAll('img'));
-                    const urls = imgs
-                        .map(img => img.currentSrc || img.src || '')
-                        .filter(src => src.includes('/backend-api/estuary/content'));
-                    if (urls.length > 0) {
-                        // Tomar la última URL (imagen final de mayor resolución)
-                        return JSON.stringify({status: 'FOUND', url: urls[urls.length - 1]});
+                    const imgs = Array.from(block.querySelectorAll('img'))
+                        .filter(img => (img.currentSrc || img.src || '').includes('/backend-api/estuary/content'));
+                    if (imgs.length > 0) {
+                        const img = imgs[imgs.length - 1];
+                        const url = img.currentSrc || img.src;
+                        const w = img.naturalWidth || 0;
+                        // Imagen con naturalWidth > 512 = version final cargada
+                        if (w > 512) {
+                            return JSON.stringify({status: 'FOUND', url: url, width: w});
+                        }
+                        // Preview de baja resolucion — seguir esperando
+                        return JSON.stringify({status: 'LOADING_HIRES', width: w});
                     }
                 }
             }
@@ -116,16 +120,15 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
             log_info("Comparación de imágenes resuelta, esperando URL...")
             time.sleep(2)
             continue
+        elif status == "LOADING_HIRES":
+            w = info.get("width", 0)
+            log_info(f"Imagen en baja resolucion (width={w}). Esperando version final...")
+            time.sleep(3)
+            continue
         elif status == "FOUND":
-            if not generation_done:
-                # Primera vez que detectamos la imagen — esperar a que se cargue
-                # la versión final de alta resolución
-                generation_done = True
-                log_info("Imagen detectada. Esperando 5s para version final de alta resolucion...")
-                time.sleep(5)
-                continue  # Volver a buscar para obtener la URL actualizada
             url = info.get("url", "")
-            log_ok(f"Imagen final encontrada: {url[:80]}...")
+            w = info.get("width", 0)
+            log_ok(f"Imagen final lista: width={w}px url={url[:80]}...")
             return url
         else:
             time.sleep(2)
@@ -135,7 +138,15 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
 
 
 def _get_cookies_via_cdp(session: ChatGPTSession) -> str:
-    """Extrae cookies de la sesion del navegador via CDP para usar en Python."""
+    """Extrae TODAS las cookies (incluidas HttpOnly) via CDP Network.getCookies."""
+    try:
+        resp = session._send_raw("Network.getCookies", {"urls": ["https://chatgpt.com"]})
+        if resp and "result" in resp:
+            cookies = resp["result"].get("cookies", [])
+            return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    except Exception:
+        pass
+    # Fallback a document.cookie (no incluye HttpOnly)
     result = session.evaluate("""(() => document.cookie)()""")
     return result or ""
 
@@ -144,14 +155,20 @@ def _download_with_python(image_url: str, cookies: str, output_path: Path) -> bo
     """Descarga la imagen directamente desde Python con las cookies del navegador.
     Evita el limite de 4MB del WebSocket CDP.
     """
+    import ssl
     import urllib.request
+
+    # Crear contexto SSL que no verifique certificados (ChatGPT usa cert propio)
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
 
     req = urllib.request.Request(image_url)
     req.add_header("Cookie", cookies)
     req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
             data = resp.read()
             if len(data) < 1000:
                 log_warn(f"Imagen muy pequeña ({len(data)} bytes)")
@@ -232,6 +249,8 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
             return str(output_path)
 
         # Estrategia 2: CDP fetch (funciona si < 4MB)
+        # Esperar a que la imagen esté completamente renderizada en el DOM
+        time.sleep(3)
         if _download_with_cdp(session, image_url, output_path):
             return str(output_path)
 
