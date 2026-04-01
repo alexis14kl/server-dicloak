@@ -42,7 +42,7 @@ if env_path.exists():
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import uvicorn
 
 from cdp_bridge import (
@@ -227,6 +227,13 @@ class PromptRequest(BaseModel):
     prompt: str
     wait_response: bool = False
     timeout: int = 120
+
+    @field_validator("prompt")
+    @classmethod
+    def prompt_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("El prompt no puede estar vacío")
+        return v.strip()
 
 class ImageDownloadRequest(BaseModel):
     port: int

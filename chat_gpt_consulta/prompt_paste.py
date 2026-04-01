@@ -60,8 +60,9 @@ class ChatGPTSession:
                 url = (t.get("url") or "").lower()
                 if "chatgpt.com" in url and t.get("type") == "page":
                     return t.get("webSocketDebuggerUrl", "")
-        except Exception:
-            pass
+            log_warn(f"No hay página chatgpt.com entre {len(targets)} targets en puerto {self.port}")
+        except Exception as e:
+            log_warn(f"No se pudo conectar a CDP en puerto {self.port}: {e}")
         return ""
 
     def is_connected(self) -> bool:
@@ -106,6 +107,20 @@ class ChatGPTSession:
             self._ws = None
             return None
 
+    def _send_raw(self, method: str, params: dict | None = None) -> dict | None:
+        """Envía comando CDP raw (Input.insertText, Input.dispatchKeyEvent, etc.)."""
+        if not self._ensure_connected():
+            return None
+        self._msg_id += 1
+        msg = json.dumps({"id": self._msg_id, "method": method, "params": params or {}})
+        try:
+            self._ws.send(msg)
+            return json.loads(self._ws.recv(timeout=10))
+        except Exception as e:
+            log_warn(f"CDP raw error ({method}): {e}")
+            self._ws = None
+            return None
+
     def close(self):
         if self._ws:
             try:
@@ -139,34 +154,75 @@ class ChatGPTSession:
         return False
 
     def paste_prompt(self, prompt: str) -> bool:
-        """Pega el prompt en el editor de ChatGPT por chunks."""
-        # Limpiar editor
-        self.evaluate("""(() => {
-            const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
-            if (editor) { editor.focus(); editor.innerHTML = '<p><br></p>'; }
-        })()""")
+        """Pega el prompt en el editor de ChatGPT via CDP Input.insertText.
+        Usa Selection/Range + Backspace para limpiar, luego inserta por chunks.
+        No interpola texto en JS — elimina riesgo de inyección.
+        """
+        selector = '#prompt-textarea[contenteditable="true"]'
+
+        # 1. Focus con Selection/Range
+        self.evaluate(f"""(() => {{
+            const editor = document.querySelector('{selector}');
+            if (!editor) return;
+            editor.focus();
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            range.collapse(false);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }})()""")
         time.sleep(0.3)
 
-        # Pegar por chunks usando InputEvent (simula tipeo)
-        chunk_size = 200
-        for i in range(0, len(prompt), chunk_size):
-            chunk = prompt[i:i + chunk_size].replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$").replace("\n", "\\n").replace("\r", "")
-            self.evaluate(f"""(() => {{
-                const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
-                if (!editor) return 'NO_EDITOR';
-                editor.focus();
-                document.execCommand('insertText', false, `{chunk}`);
-                return 'OK';
-            }})()""")
-            if i + chunk_size < len(prompt):
+        # 2. Clear con selectNodeContents + Backspace CDP
+        self.evaluate(f"""(() => {{
+            const editor = document.querySelector('{selector}');
+            if (!editor) return;
+            editor.focus();
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }})()""")
+        self._send_raw("Input.dispatchKeyEvent", {
+            "type": "keyDown", "key": "Backspace", "code": "Backspace",
+            "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8,
+        })
+        self._send_raw("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": "Backspace", "code": "Backspace",
+            "windowsVirtualKeyCode": 8, "nativeVirtualKeyCode": 8,
+        })
+        time.sleep(0.3)
+
+        # 3. Focus de nuevo
+        self.evaluate(f"""(() => {{
+            const editor = document.querySelector('{selector}');
+            if (!editor) return;
+            editor.focus();
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            range.collapse(false);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }})()""")
+        time.sleep(0.3)
+
+        # 4. Insert con Input.insertText por chunks (CDP directo, sin JS string)
+        CHUNK_SIZE = 200
+        for i in range(0, len(prompt), CHUNK_SIZE):
+            chunk = prompt[i:i + CHUNK_SIZE]
+            self._send_raw("Input.insertText", {"text": chunk})
+            if i + CHUNK_SIZE < len(prompt):
                 time.sleep(0.05)
 
-        # Verificar que se pegó
+        # 5. Verificar que se registró
         time.sleep(0.5)
-        text = self.evaluate("""(() => {
-            const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
+        text = self.evaluate(f"""(() => {{
+            const editor = document.querySelector('{selector}');
             return (editor?.innerText || '').trim().substring(0, 100);
-        })()""") or ""
+        }})()""") or ""
 
         if len(text) > 10:
             log_ok(f"Prompt pegado ({len(prompt)} chars)")
@@ -193,18 +249,34 @@ class ChatGPTSession:
             log_ok("Prompt enviado")
             return True
 
-        # Fallback: Enter
+        # Fallback: Enter via CDP
         log_info("Botón no encontrado, intentando Enter...")
         self.evaluate("""(() => {
             const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
-            if (editor) {
-                editor.focus();
-                const event = new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', bubbles: true});
-                editor.dispatchEvent(event);
-            }
+            if (editor) editor.focus();
         })()""")
-        time.sleep(1)
-        return True
+        self._send_raw("Input.dispatchKeyEvent", {
+            "type": "keyDown", "key": "Enter", "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+        })
+        self._send_raw("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": "Enter", "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+        })
+        time.sleep(2)
+
+        # Verificar que el editor se vació (prompt enviado)
+        text_after = self.evaluate("""(() => {
+            const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
+            return (editor?.innerText || '').trim();
+        })()""") or ""
+
+        if len(text_after) < 5:
+            log_ok("Prompt enviado via Enter")
+            return True
+
+        log_warn("Enter no envió el prompt")
+        return False
 
     def wait_for_response(self, timeout_sec: int = 120) -> bool:
         """Espera que ChatGPT termine de generar la respuesta."""
