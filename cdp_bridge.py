@@ -176,11 +176,11 @@ def list_profiles_via_cdp(port: int = DEFAULT_DICLOAK_PORT) -> list[ProfileInfo]
             const profiles = [];
             rows.forEach(row => {
                 const cells = Array.from(row.querySelectorAll('td .cell'));
-                const serial = (cells[1]?.innerText || '').trim();
-                const name = (cells[2]?.innerText || '').trim();
-                const group = (cells[3]?.innerText || '').trim();
-                if (name && name.length > 1) {
-                    profiles.push({ id: serial, name, status: group });
+                const texts = cells.map(c => (c.innerText || '').trim()).filter(t => t.length > 1);
+                // Nombre perfil = primera celda que contiene letras (no solo numeros)
+                const name = texts.find(t => /[a-zA-Z]/.test(t)) || '';
+                if (name) {
+                    profiles.push({ id: name, name, status: '' });
                 }
             });
             return JSON.stringify(profiles);
@@ -256,8 +256,11 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
 
             for (const row of rows) {{
                 const cells = Array.from(row.querySelectorAll('td .cell'));
-                const nameCell = (cells[2]?.innerText || '').trim();
-                if (nameCell.toLowerCase() === targetName || nameCell.toLowerCase().includes(targetName) || targetName.includes(nameCell.toLowerCase())) {{
+                const match = cells.some(c => {{
+                    const t = (c.innerText || '').trim().toLowerCase();
+                    return t.length > 1 && (t === targetName || t.includes(targetName) || targetName.includes(t));
+                }});
+                if (match) {{
                     targetRow = row;
                     break;
                 }}
