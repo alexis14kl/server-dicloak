@@ -237,6 +237,11 @@ class Veo3StabilizeRequest(BaseModel):
     port: int
     timeout: int = 60
 
+class Veo3DownloadVideoRequest(BaseModel):
+    port: int
+    output_dir: str = ""
+    timeout: int = 600
+
 
 # ── Auto-launch ──────────────────────────────────────────────────────────────
 
@@ -294,6 +299,7 @@ def index():
             "POST /chatgpt/download-image",
             "POST /veo3/stabilize",
             "POST /veo3/new-project",
+            "POST /veo3/download-video",
         ],
     })
 
@@ -421,6 +427,17 @@ def veo3_new_project(req: Veo3NewProjectRequest):
         result = open_new_project(port=req.port, prompt=req.prompt)
         if result.get("success"):
             return success_response(data=result, message="Nuevo proyecto abierto en Flow")
+        return error_response(result.get("error", "Error desconocido"), 500)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+@app.post("/veo3/download-video")
+def veo3_download_video(req: Veo3DownloadVideoRequest):
+    try:
+        from chat_veo3_videos.video_download import download_video
+        result = download_video(port=req.port, output_dir=req.output_dir, timeout=req.timeout)
+        if result.get("success"):
+            return success_response(data=result, message="Video descargado")
         return error_response(result.get("error", "Error desconocido"), 500)
     except Exception as e:
         return error_response(str(e), 500)
