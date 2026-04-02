@@ -5,27 +5,36 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.pyd
 *.egg-info/
+*.egg
 dist/
 build/
-*.egg
 
-# Virtual environments
-venv/
-.venv/
-env/
+# Logs
+debug.log
+*.log
 
-# Environment variables
-.env
+# Output (downloaded images/videos)
+output/
 
-# OS
-.DS_Store
-Thumbs.db
+# HTTP collection (API test requests)
+coleccion_api/
 
 # IDE
 .vscode/
 .idea/
 
-# Dependencias instaladas (pip)
-# fastapi, uvicorn, websockets, pyautogui, pydantic
-# Se instalan con: pip install fastapi uvicorn websockets pyautogui
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Screenshots from tests
+resource_claude_cdp/screenshots/
