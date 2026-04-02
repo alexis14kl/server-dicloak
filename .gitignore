@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Logs
+debug.log
+*.log
+
+# Output (downloaded images/videos)
+output/
+
+# HTTP collection (API test requests)
+coleccion_api/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Screenshots from tests
+resource_claude_cdp/screenshots/
