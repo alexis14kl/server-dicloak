@@ -57,6 +57,8 @@ from cdp_bridge import (
     _test_cdp_port,
     _get_page_ws_url,
     init_cdp,
+    cdp_evaluate_sync,
+    _ensure_on_profile_list,
     DEFAULT_DICLOAK_PORT,
 )
 from platform_utils import (
@@ -67,6 +69,8 @@ from platform_utils import (
     read_cdp_debug_info,
     write_cdp_debug_info,
 )
+from api import DICloakAPI
+from logger import log_info, log_ok, log_warn
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -116,6 +120,16 @@ class DICloakService:
         }
 
     def get_profiles(self) -> list[dict]:
+        # Intentar primero via REST API (puerto 52140) — más fiable que scraping DOM
+        try:
+            api = DICloakAPI()
+            profiles = api.list_profiles()
+            if profiles:
+                return [{"id": p.id, "name": p.name, "status": p.status} for p in profiles]
+        except Exception:
+            pass
+
+        # Fallback: scraping del DOM via CDP
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde en puerto CDP.")
         profiles = list_profiles_via_cdp(self.port)
@@ -143,28 +157,20 @@ class DICloakService:
             })
         return running
 
-    def open_profile(self, name: str, timeout: int = 60) -> dict:
-        if not name:
-            raise ValueError("El nombre del perfil es requerido.")
-        if not is_dicloak_ready(self.port):
-            raise ConnectionError("DICloak no responde. Verifica que este abierto.")
+    def _detect_cdp_port_fast(self, known_ports: set[int], timeout: int = 30) -> int:
+        """Detecta un puerto CDP nuevo combinando cdp_debug_info.json y escaneo de procesos.
 
-        # Vaciar cdp_debug_info.json para detectar cualquier puerto nuevo
-        write_cdp_debug_info({})
+        Alterna entre polling rápido del archivo JSON y escaneo de procesos
+        cada ~10 segundos para maximizar la probabilidad de detección.
+        """
+        deadline = time.time() + timeout
+        process_scan_interval = 8  # escanear procesos cada N segundos
+        last_scan = 0
 
-        # Re-inyectar hook (puede perderse si DiCloak recargó)
-        inject_cdp_hook(self.port)
-
-        clicked = open_profile_via_cdp(name, self.port)
-        if not clicked:
-            available = [p.name for p in list_profiles_via_cdp(self.port)]
-            raise FileNotFoundError(
-                f"Perfil '{name}' no encontrado. Disponibles: {available}"
-            )
-
-        # Esperar a que aparezca un puerto CDP activo en el archivo
-        deadline = time.time() + min(timeout, 30)
         while time.time() < deadline:
+            elapsed = time.time() - (deadline - timeout)
+
+            # cdp_debug_info.json — check rápido (< 1ms)
             data = read_cdp_debug_info()
             for entry in data.values():
                 if not isinstance(entry, dict):
@@ -173,21 +179,61 @@ class DICloakService:
                     port = int(entry.get("debugPort") or entry.get("port") or 0)
                 except (TypeError, ValueError):
                     continue
-                if port and _test_cdp_port(port):
-                    return {
-                        "name": name,
-                        "debug_port": port,
-                        "ws_url": str(entry.get("webSocketUrl") or ""),
-                        "cdp_active": True,
-                    }
+                if port and port not in known_ports and _test_cdp_port(port):
+                    log_ok(f"Puerto CDP detectado via cdp_debug_info: {port}")
+                    return port
+
+            # Escaneo de procesos — cada ~8s (tarda ~1s en PowerShell)
+            if elapsed - last_scan >= process_scan_interval:
+                last_scan = elapsed
+                for p in self.get_running_profiles():
+                    port = p.get("debug_port", 0)
+                    if port and port not in known_ports and p.get("cdp_active"):
+                        log_ok(f"Puerto CDP detectado via proceso: {port}")
+                        return port
+
             time.sleep(0.5)
 
+        log_warn("No se detectó puerto CDP en el tiempo límite")
+        return 0
+
+    def open_profile(self, name: str, timeout: int = 60) -> dict:
+        if not name:
+            raise ValueError("El nombre del perfil es requerido.")
+        if not is_dicloak_ready(self.port):
+            raise ConnectionError("DICloak no responde. Verifica que este abierto.")
+
+        # ── Capturar puertos CDP ya existentes (rápido: solo cdp_debug_info) ─
+        known_ports = {self.port}
+        data = read_cdp_debug_info()
+        for entry in data.values():
+            if isinstance(entry, dict):
+                try:
+                    p = int(entry.get("debugPort") or entry.get("port") or 0)
+                    if p:
+                        known_ports.add(p)
+                except (TypeError, ValueError):
+                    pass
+
+        # ── Preparar: limpiar + inyectar hook ────────────────────────────
+        write_cdp_debug_info({})
+        inject_cdp_hook(self.port)
+
+        # ── Abrir perfil via click en la UI ──────────────────────────────
+        clicked = open_profile_via_cdp(name, self.port)
+        if not clicked:
+            available = [p["name"] for p in self.get_profiles()]
+            raise FileNotFoundError(
+                f"Perfil '{name}' no encontrado. Disponibles: {available}"
+            )
+
+        # ── Detectar el nuevo puerto CDP (max ~30s) ──────────────────────
+        port = self._detect_cdp_port_fast(known_ports, timeout=min(timeout, 40))
         return {
             "name": name,
-            "debug_port": 0,
+            "debug_port": port,
             "ws_url": "",
-            "cdp_active": False,
-            "clicked": True,
+            "cdp_active": port > 0,
         }
 
     def close_profiles(self) -> int:
@@ -198,9 +244,19 @@ class DICloakService:
             else:
                 subprocess.run(["pkill", "-f", "ginsbrowser"],
                                capture_output=True, timeout=5)
-            # Limpiar cdp_debug_info para que no queden puertos fantasma
-            from platform_utils import write_cdp_debug_info
             write_cdp_debug_info({})
+
+            # Limpiar estado zombie en DICloak: navegar fuera y volver
+            # para que la UI sincronice el estado real de los procesos
+            try:
+                cdp_evaluate_sync("location.hash = '#/personalInfo'", self.port, timeout=3)
+                time.sleep(2)
+                _ensure_on_profile_list(self.port)
+                time.sleep(2)
+                inject_cdp_hook(self.port)
+            except Exception:
+                pass
+
             return 1
         except Exception:
             return 0
@@ -487,7 +543,7 @@ def chatgpt_download_image(req: ImageDownloadRequest):
                 result["image_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/images/{file_name}"
             _notify_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Imagen descargada")
-        return error_response(result.get("error", "Error desconocido"), 500)
+        return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 
