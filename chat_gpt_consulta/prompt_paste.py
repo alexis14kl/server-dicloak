@@ -137,13 +137,32 @@ class ChatGPTSession:
     def wait_for_page_ready(self, timeout_sec: int = 60) -> bool:
         """Espera que ChatGPT cargue completamente (sin CAPTCHA)."""
         deadline = time.time() + timeout_sec
+        consecutive_fails = 0
         while time.time() < deadline:
             title = self.evaluate("document.title") or ""
+
+            # Si evaluate falla (timeout CDP), reconectar y reintentar
+            if title is None or title == "":
+                consecutive_fails += 1
+                if consecutive_fails >= 2:
+                    log_info("CDP no responde, reconectando...")
+                    self._ws = None
+                    time.sleep(3)
+                    if not self.connect():
+                        time.sleep(2)
+                        continue
+                    consecutive_fails = 0
+                else:
+                    time.sleep(2)
+                continue
+
+            consecutive_fails = 0
+
             if "un momento" in title.lower() or "just a moment" in title.lower():
                 log_info("Esperando CAPTCHA de Cloudflare...")
                 time.sleep(2)
                 continue
-            if not title or title == "about:blank":
+            if title == "about:blank":
                 time.sleep(1)
                 continue
             # Verificar que el editor esté listo
@@ -316,52 +335,59 @@ class ChatGPTSession:
     # ── Detección de tokens y sesión ─────────────────────────────────────
 
     def detect_token_status(self, timeout_sec: int = 90) -> str:
-        """Espera la respuesta y detecta si hay error de tokens o sesión.
+        """Espera la respuesta de ChatGPT y detecta si hay error de tokens o sesión.
+
         Retorna: 'success', 'no_image_tokens', 'session_expired'
+
+        Flujo:
+          1. Esperar a que ChatGPT empiece a responder (nuevo turno del asistente)
+          2. Esperar a que termine de responder (stop button desaparece)
+          3. Verificar si la respuesta es un error de tokens
         """
         deadline = time.time() + timeout_sec
-        idle_cycles = 0
-        time.sleep(3)
 
+        # ── Fase 1: Esperar que ChatGPT empiece a responder ──────────────
+        # Contar turnos actuales para detectar un nuevo turno del asistente
+        initial_turns = self.evaluate("""(() => {
+            return document.querySelectorAll(
+                '[data-testid^="conversation-turn"],[data-message-id],article'
+            ).length;
+        })()""")
+        initial_count = int(initial_turns or "0")
+
+        response_started = False
         while time.time() < deadline:
-            # Detectar tokens agotados
-            no_tokens = self.evaluate("""(() => {
-                const text = (document.body?.innerText || '').toLowerCase()
-                    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
-                const phrases = [
-                    'has alcanzado tu limite de creacion de imagenes',
-                    'el limite se restablece',
-                    'youve hit the team plan limit for image generations',
-                    'you can create more images when the limit resets',
-                    'no pude invocar la herramienta de generacion de imagenes',
-                    'cannot generate more images',
-                    'image generation limit',
-                ];
-                return phrases.some(p => text.includes(p)) ? 'YES' : 'NO';
+            current = self.evaluate("""(() => {
+                return document.querySelectorAll(
+                    '[data-testid^="conversation-turn"],[data-message-id],article'
+                ).length;
             })()""")
-            if no_tokens == "YES":
-                log_warn("Tokens de imagen agotados detectados")
+            if int(current or "0") > initial_count:
+                response_started = True
+                break
+
+            # Mientras esperamos, chequear tokens por si el mensaje ya apareció
+            if self._check_no_tokens():
                 return "no_image_tokens"
 
-            # Detectar sesión expirada
-            expired = self.evaluate("""(() => {
-                const text = (document.body?.innerText || '').toLowerCase()
-                    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
-                const phrases = [
-                    'tu sesion ha caducado',
-                    'vuelve a iniciar sesion',
-                    'your session has expired',
-                    'sign in again to continue',
-                    'session expired',
-                ];
-                const hasDialog = !!document.querySelector('[role="dialog"]');
-                return (hasDialog && phrases.some(p => text.includes(p))) ? 'YES' : 'NO';
-            })()""")
-            if expired == "YES":
-                log_warn("Sesión expirada detectada")
+            time.sleep(1)
+
+        if not response_started:
+            # Timeout esperando respuesta — verificar tokens una vez más
+            if self._check_no_tokens():
+                return "no_image_tokens"
+            return "success"
+
+        # ── Fase 2: Esperar que ChatGPT termine de responder ─────────────
+        idle_cycles = 0
+        while time.time() < deadline:
+            # Chequear tokens en cada ciclo (puede aparecer en cualquier momento)
+            if self._check_no_tokens():
+                return "no_image_tokens"
+
+            if self._check_session_expired():
                 return "session_expired"
 
-            # Verificar si sigue generando
             generating = self.evaluate("""(() => {
                 const stop = document.querySelector('button[data-testid="stop-button"]')
                     || document.querySelector('button[aria-label="Stop generating"]');
@@ -375,12 +401,68 @@ class ChatGPTSession:
                 idle_cycles = 0
             else:
                 idle_cycles += 1
-                if idle_cycles >= 5:
-                    return "success"
+                # Esperar suficientes ciclos para que el mensaje completo se renderice
+                if idle_cycles >= 8:
+                    break
 
             time.sleep(1)
 
+        # ── Fase 3: Verificación final después de que ChatGPT terminó ────
+        # Dar tiempo extra para que el DOM se actualice completamente
+        time.sleep(2)
+        if self._check_no_tokens():
+            return "no_image_tokens"
+        if self._check_session_expired():
+            return "session_expired"
+
         return "success"
+
+    def _check_no_tokens(self) -> bool:
+        """Verifica si el texto de la página indica tokens de imagen agotados."""
+        result = self.evaluate("""(() => {
+            const text = (document.body?.innerText || '').toLowerCase()
+                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+            const phrases = [
+                'has alcanzado tu limite',
+                'el limite se restablece',
+                'hit the team plan limit',
+                'hit the plan limit',
+                'youve hit',
+                'you can create more images when the limit resets',
+                'no pude invocar la herramienta de generacion de imagenes',
+                'cannot generate more images',
+                'image generation limit',
+                'image generations request',
+                'limite de generacion de imagen',
+                'limite de creacion de imagen',
+                'the limit resets in',
+            ];
+            return phrases.some(p => text.includes(p)) ? 'YES' : 'NO';
+        })()""")
+        if result == "YES":
+            log_warn("Tokens de imagen agotados detectados")
+            return True
+        return False
+
+    def _check_session_expired(self) -> bool:
+        """Verifica si la sesión de ChatGPT expiró."""
+        result = self.evaluate("""(() => {
+            const text = (document.body?.innerText || '').toLowerCase()
+                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+            const phrases = [
+                'tu sesion ha caducado',
+                'vuelve a iniciar sesion',
+                'your session has expired',
+                'sign in again to continue',
+                'session expired',
+            ];
+            const hasDialog = !!document.querySelector('[role="dialog"]');
+            return (hasDialog && phrases.some(p => text.includes(p))) ? 'YES' : 'NO';
+        })()""")
+        if result == "YES":
+            log_warn("Sesión expirada detectada")
+            return True
+        return False
 
     # ── Rotación de cuentas ──────────────────────────────────────────────
 
@@ -388,23 +470,49 @@ class ChatGPTSession:
         """Abre menú de perfil, lista cuentas, click en una no agotada.
         Retorna dict con switched, account_id, account_label, available_count.
         """
-        # 1. Click en botón de perfil
+        # 1. Click en botón de perfil (múltiples selectores por si la UI cambió)
         clicked = self.evaluate("""(() => {
-            const btn = document.querySelector('[data-testid="accounts-profile-button"]');
-            if (btn) { btn.click(); return 'CLICKED'; }
+            const selectors = [
+                '[data-testid="accounts-profile-button"]',
+                '[data-testid="profile-button"]',
+                'button[aria-label*="Account"]',
+                'button[aria-label*="Cuenta"]',
+                'button[aria-label*="Profile"]',
+                'button[aria-label*="Perfil"]',
+                'nav button img[alt]',
+            ];
+            for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (btn) {
+                    const target = btn.closest('button') || btn;
+                    target.click();
+                    return 'CLICKED:' + sel;
+                }
+            }
             return 'NO_BUTTON';
         })()""")
-        if clicked != "CLICKED":
+        if not clicked or not clicked.startswith("CLICKED"):
             log_warn("No se encontró botón de perfil")
             return {"switched": False, "reason": "no_profile_button"}
+        log_info(f"Botón de perfil clickeado: {clicked}")
 
         time.sleep(2)
 
-        # 2. Esperar menú
-        menu_ready = self.evaluate("""(() => {
-            return !!document.querySelector('[role="menu"]') ? 'YES' : 'NO';
-        })()""")
-        if menu_ready != "YES":
+        # 2. Esperar menú (múltiples intentos)
+        menu_found = False
+        for _try in range(3):
+            menu_ready = self.evaluate("""(() => {
+                const menu = document.querySelector('[role="menu"]')
+                    || document.querySelector('[data-radix-menu-content]')
+                    || document.querySelector('[role="listbox"]');
+                return menu ? 'YES' : 'NO';
+            })()""")
+            if menu_ready == "YES":
+                menu_found = True
+                break
+            time.sleep(1)
+
+        if not menu_found:
             log_warn("Menú de perfil no apareció")
             return {"switched": False, "reason": "menu_not_found"}
 
@@ -565,8 +673,8 @@ def paste_and_send_with_rotation(
         for attempt in range(MAX_ROTATION_ATTEMPTS):
             log_info(f"Intento {attempt + 1}/{MAX_ROTATION_ATTEMPTS}")
 
-            # Esperar página lista
-            if not session.wait_for_page_ready(timeout_sec=30):
+            # Esperar página lista (60s para dar tiempo a que cargue)
+            if not session.wait_for_page_ready(timeout_sec=60):
                 return {"success": False, "error": "ChatGPT no cargó completamente"}
 
             # Pegar prompt

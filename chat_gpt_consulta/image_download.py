@@ -38,104 +38,167 @@ def _build_filename(source_url: str) -> str:
     return f"{timestamp}_{safe_file_id}.png"
 
 
-def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
-    """Espera que ChatGPT genere la imagen y retorna la URL.
+def _check_image_state(session: ChatGPTSession) -> dict:
+    """Evalúa el estado actual de generación de imagen en ChatGPT.
 
-    Espera a que ChatGPT termine completamente de generar (stop button desaparece),
-    luego espera a que la imagen final de alta resolución se cargue.
+    Retorna dict con: status, url, width, complete.
+    status: GENERATING, COMPARISON_RESOLVED, WAITING, LOADING, READY
+    """
+    result = session.evaluate("""(() => {
+        // Buscar comparación de imágenes y seleccionar la primera
+        const compBtns = Array.from(document.querySelectorAll('button,[role="button"],label'))
+            .filter(el => /la imagen 1 es mejor|image 1 is better/i.test(
+                (el.innerText || el.getAttribute('aria-label') || '').trim()
+            ));
+        if (compBtns.length > 0) {
+            compBtns[0].click();
+            return JSON.stringify({status: 'COMPARISON_RESOLVED'});
+        }
+
+        // Verificar si todavía está generando
+        const stop = document.querySelector('button[data-testid="stop-button"]')
+            || document.querySelector('button[aria-label="Stop generating"]');
+        if (stop) {
+            return JSON.stringify({status: 'GENERATING'});
+        }
+
+        // Generación terminada — buscar imagen
+        const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
+        const messages = Array.from(document.querySelectorAll('[data-message-id]'));
+        const articles = Array.from(document.querySelectorAll('article'));
+        const allBlocks = turns.length > 0 ? turns : messages.length > 0 ? messages : articles;
+        const candidates = allBlocks.slice(-2).reverse();
+
+        for (const block of candidates) {
+            const hasDownload = Array.from(block.querySelectorAll('button,[role="button"],a'))
+                .some(el => /descargar esta imagen|download this image/i.test(
+                    (el.innerText || el.getAttribute('aria-label') || '').trim()
+                ));
+            const hasOverlay = !!block.querySelector('[data-testid="image-gen-overlay-actions"]');
+            const hasCreatedText = /imagen creada|image created/i.test(block.innerText || '');
+
+            if (hasDownload || hasOverlay || hasCreatedText) {
+                const imgs = Array.from(block.querySelectorAll('img'))
+                    .filter(img => (img.currentSrc || img.src || '').includes('/backend-api/'));
+                if (imgs.length > 0) {
+                    const img = imgs[imgs.length - 1];
+                    const url = img.currentSrc || img.src;
+                    const w = img.naturalWidth || 0;
+                    const h = img.naturalHeight || 0;
+                    const complete = img.complete === true;
+                    return JSON.stringify({
+                        status: (w > 512 && complete) ? 'READY' : 'LOADING',
+                        url, width: w, height: h, complete
+                    });
+                }
+            }
+        }
+
+        return JSON.stringify({status: 'WAITING'});
+    })()""")
+
+    if not result:
+        return {"status": "WAITING"}
+    try:
+        return json.loads(result)
+    except Exception:
+        return {"status": "WAITING"}
+
+
+# Cantidad de checks consecutivos con la misma URL para considerar estable
+_STABLE_CHECKS_REQUIRED = 4
+_STABLE_CHECK_INTERVAL = 2  # segundos entre cada check de estabilidad
+
+
+def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
+    """Espera que ChatGPT genere la imagen y retorna la URL final estable.
+
+    La imagen de ChatGPT pasa por varias fases:
+      1. GENERATING — el stop button está visible
+      2. LOADING — la imagen aparece pero aún carga (baja resolución / progresiva)
+      3. READY — img.complete=true y naturalWidth > 512
+
+    Después de READY, esperamos que la URL sea estable (no cambie) durante
+    varios checks consecutivos, para asegurar que es la versión final
+    y no un preview intermedio.
     """
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
-    generation_done = False
+
+    stable_url = ""
+    stable_count = 0
+    token_check_counter = 0
 
     while time.time() < deadline:
-        result = session.evaluate("""(() => {
-            // Buscar comparación de imágenes y seleccionar la primera
-            const compBtns = Array.from(document.querySelectorAll('button,[role="button"],label'))
-                .filter(el => /la imagen 1 es mejor|image 1 is better/i.test(
-                    (el.innerText || el.getAttribute('aria-label') || '').trim()
-                ));
-            if (compBtns.length > 0) {
-                compBtns[0].click();
-                return JSON.stringify({status: 'COMPARISON_RESOLVED'});
-            }
+        # Cada 5 ciclos, verificar si ChatGPT respondió con error de tokens
+        # en vez de generar una imagen (evita esperar 300s en vano)
+        token_check_counter += 1
+        if token_check_counter % 5 == 0:
+            if session._check_no_tokens():
+                log_warn("Tokens agotados detectados durante espera de imagen")
+                return ""
 
-            // Verificar si todavía está generando
-            const stop = document.querySelector('button[data-testid="stop-button"]')
-                || document.querySelector('button[aria-label="Stop generating"]');
-            if (stop) {
-                return JSON.stringify({status: 'GENERATING'});
-            }
-
-            // Generación terminada — buscar imagen final
-            const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
-            const messages = Array.from(document.querySelectorAll('[data-message-id]'));
-            const articles = Array.from(document.querySelectorAll('article'));
-            const allBlocks = turns.length > 0 ? turns : messages.length > 0 ? messages : articles;
-            const candidates = allBlocks.slice(-2).reverse();
-
-            for (const block of candidates) {
-                const hasDownload = Array.from(block.querySelectorAll('button,[role="button"],a'))
-                    .some(el => /descargar esta imagen|download this image/i.test(
-                        (el.innerText || el.getAttribute('aria-label') || '').trim()
-                    ));
-                const hasOverlay = !!block.querySelector('[data-testid="image-gen-overlay-actions"]');
-                const hasCreatedText = /imagen creada|image created/i.test(block.innerText || '');
-
-                if (hasDownload || hasOverlay || hasCreatedText) {
-                    const imgs = Array.from(block.querySelectorAll('img'));
-                    const urls = imgs
-                        .map(img => img.currentSrc || img.src || '')
-                        .filter(src => src.includes('/backend-api/estuary/content'));
-                    if (urls.length > 0) {
-                        // Tomar la última URL (imagen final de mayor resolución)
-                        return JSON.stringify({status: 'FOUND', url: urls[urls.length - 1]});
-                    }
-                }
-            }
-
-            return JSON.stringify({status: 'WAITING'});
-        })()""")
-
-        if not result:
-            time.sleep(2)
-            continue
-
-        try:
-            info = json.loads(result)
-        except Exception:
-            time.sleep(2)
-            continue
-
+        info = _check_image_state(session)
         status = info.get("status", "")
 
         if status == "GENERATING":
+            stable_url, stable_count = "", 0
             time.sleep(2)
             continue
-        elif status == "COMPARISON_RESOLVED":
+
+        if status == "COMPARISON_RESOLVED":
             log_info("Comparación de imágenes resuelta, esperando URL...")
+            stable_url, stable_count = "", 0
             time.sleep(2)
             continue
-        elif status == "FOUND":
-            if not generation_done:
-                # Primera vez que detectamos la imagen — esperar a que se cargue
-                # la versión final de alta resolución
-                generation_done = True
-                log_info("Imagen detectada. Esperando 5s para version final de alta resolucion...")
-                time.sleep(5)
-                continue  # Volver a buscar para obtener la URL actualizada
+
+        if status == "LOADING":
+            w = info.get("width", 0)
+            log_info(f"Imagen cargando (width={w}, complete={info.get('complete')}). Esperando...")
+            stable_url, stable_count = "", 0
+            time.sleep(3)
+            continue
+
+        if status == "READY":
             url = info.get("url", "")
-            log_ok(f"Imagen final encontrada: {url[:80]}...")
-            return url
-        else:
-            time.sleep(2)
+            w = info.get("width", 0)
+
+            if url == stable_url:
+                stable_count += 1
+            else:
+                # URL cambió — reiniciar contador de estabilidad
+                stable_url = url
+                stable_count = 1
+                log_info(f"Imagen detectada (width={w}). Verificando estabilidad...")
+
+            if stable_count >= _STABLE_CHECKS_REQUIRED:
+                log_ok(f"Imagen final estable: width={w}px ({stable_count} checks)")
+                return url
+
+            time.sleep(_STABLE_CHECK_INTERVAL)
+            continue
+
+        # WAITING — no hay imagen aún, chequear tokens más frecuente
+        stable_url, stable_count = "", 0
+        if session._check_no_tokens():
+            log_warn("Tokens agotados detectados durante espera de imagen")
+            return ""
+        time.sleep(2)
 
     log_warn("Timeout esperando imagen")
     return ""
 
 
 def _get_cookies_via_cdp(session: ChatGPTSession) -> str:
-    """Extrae cookies de la sesion del navegador via CDP para usar en Python."""
+    """Extrae TODAS las cookies (incluidas HttpOnly) via CDP Network.getCookies."""
+    try:
+        resp = session._send_raw("Network.getCookies", {"urls": ["https://chatgpt.com"]})
+        if resp and "result" in resp:
+            cookies = resp["result"].get("cookies", [])
+            return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    except Exception:
+        pass
+    # Fallback a document.cookie (no incluye HttpOnly)
     result = session.evaluate("""(() => document.cookie)()""")
     return result or ""
 
@@ -144,14 +207,20 @@ def _download_with_python(image_url: str, cookies: str, output_path: Path) -> bo
     """Descarga la imagen directamente desde Python con las cookies del navegador.
     Evita el limite de 4MB del WebSocket CDP.
     """
+    import ssl
     import urllib.request
+
+    # Crear contexto SSL que no verifique certificados (ChatGPT usa cert propio)
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
 
     req = urllib.request.Request(image_url)
     req.add_header("Cookie", cookies)
     req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
             data = resp.read()
             if len(data) < 1000:
                 log_warn(f"Imagen muy pequeña ({len(data)} bytes)")
@@ -209,12 +278,20 @@ def _download_with_cdp(session: ChatGPTSession, image_url: str, output_path: Pat
     return True
 
 
-def download_image(session: ChatGPTSession, image_url: str, output_dir: str = "") -> str:
-    """Descarga la imagen generada por ChatGPT.
+# Tamaño mínimo para considerar una imagen como final de DALL-E (no preview).
+# DALL-E 1024x1536 genera imágenes de 1.5-3MB. Previews progresivos pesan 100-500KB.
+_MIN_FINAL_IMAGE_SIZE = 800_000  # 800KB
 
-    Estrategia:
-    1. Intenta descargar via Python directo (sin limite de tamaño)
-    2. Fallback a CDP fetch (para imagenes pequeñas)
+
+def download_image(session: ChatGPTSession, image_url: str, output_dir: str = "") -> str:
+    """Descarga la imagen FINAL generada por ChatGPT.
+
+    ChatGPT sirve la misma URL con calidad progresiva:
+      - Primero: preview borroso (~100-500KB)
+      - Después: imagen final (~1.5-3MB)
+
+    Estrategia: descarga, verifica tamaño >= 800KB, si no espera y reintenta.
+    Hasta 8 intentos con espera creciente.
 
     Returns: ruta del archivo descargado o "" si falla.
     """
@@ -223,21 +300,45 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
     filename = _build_filename(image_url)
     output_path = out_dir / filename
 
-    for attempt in range(3):
-        log_info(f"Descargando imagen (intento {attempt + 1}/3)...")
+    # Esperar antes del primer intento para dar tiempo a la renderización final
+    log_info("Esperando 10s para que ChatGPT finalice el renderizado...")
+    time.sleep(10)
 
-        # Estrategia 1: Python directo con cookies del navegador
-        cookies = _get_cookies_via_cdp(session)
+    cookies = _get_cookies_via_cdp(session)
+
+    for attempt in range(8):
+        wait_secs = 5 + attempt * 3  # 5, 8, 11, 14, 17, 20, 23, 26
+
+        log_info(f"Descargando imagen (intento {attempt + 1}/8)...")
+
+        # Re-obtener cookies si no las tenemos
+        if not cookies:
+            cookies = _get_cookies_via_cdp(session)
+
         if cookies and _download_with_python(image_url, cookies, output_path):
-            return str(output_path)
+            file_size = output_path.stat().st_size
+            if file_size >= _MIN_FINAL_IMAGE_SIZE:
+                log_ok(f"Imagen final descargada: {file_size:,} bytes")
+                return str(output_path)
+            log_warn(f"Preview descargado ({file_size:,} bytes < {_MIN_FINAL_IMAGE_SIZE:,}). "
+                     f"Esperando {wait_secs}s para version final...")
+            output_path.unlink(missing_ok=True)
+        else:
+            log_warn(f"Descarga falló. Esperando {wait_secs}s...")
 
-        # Estrategia 2: CDP fetch (funciona si < 4MB)
-        if _download_with_cdp(session, image_url, output_path):
-            return str(output_path)
+        time.sleep(wait_secs)
 
-        time.sleep(3)
+        # Re-verificar si la URL cambió
+        info = _check_image_state(session)
+        new_url = info.get("url", "")
+        if new_url and new_url != image_url:
+            log_info("URL de imagen actualizada, usando nueva URL")
+            image_url = new_url
+            filename = _build_filename(image_url)
+            output_path = out_dir / filename
+            cookies = _get_cookies_via_cdp(session)  # refrescar cookies
 
-    log_error("No se pudo descargar la imagen después de 3 intentos")
+    log_error("No se pudo descargar la imagen final después de 8 intentos")
     return ""
 
 
@@ -261,6 +362,13 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300)
         # Esperar imagen
         image_url = wait_for_image(session, timeout_sec=timeout)
         if not image_url:
+            # Determinar si fue por tokens agotados o timeout genérico
+            if session._check_no_tokens():
+                return {
+                    "success": False,
+                    "error": "all_accounts_exhausted",
+                    "message": "Tokens de imagen agotados en este perfil",
+                }
             return {"success": False, "error": "No se generó imagen en el tiempo de espera"}
 
         # Descargar
