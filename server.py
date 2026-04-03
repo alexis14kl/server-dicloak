@@ -558,22 +558,6 @@ def veo3_extend_video(req: Veo3ExtendVideoRequest):
     except Exception as e:
         return error_response(str(e), 500)
 
-@app.post("/veo3/download-video")
-def veo3_download_video(req: Veo3DownloadVideoRequest):
-    try:
-        from chat_veo3_videos.exten_video import download_extended_video
-        result = download_extended_video(
-            port=req.port,
-            timeout=req.timeout,
-            output_dir=req.output_dir,
-        )
-        if result.get("success"):
-            return success_response(data=result, message="Video descargado")
-        return error_response(result.get("error", "Error desconocido"), 500, details=result)
-    except Exception as e:
-        return error_response(str(e), 500)
-
-
 def _notify_webhook(url: str, job_id: str, result: dict) -> None:
     """Fire-and-forget: notifica al webhook sin bloquear el response."""
     if not url:
