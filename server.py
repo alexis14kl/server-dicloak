@@ -557,21 +557,30 @@ def veo3_extend_video(req: Veo3ExtendVideoRequest):
         return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)
+def _notify_webhook(url: str, job_id: str, result: dict) -> None:
+    """Fire-and-forget: notifica al webhook sin bloquear el response."""
+    if not url:
+        return
 
-@app.post("/veo3/download-video")
-def veo3_download_video(req: Veo3DownloadVideoRequest):
-    try:
-        from chat_veo3_videos.exten_video import download_extended_video
-        result = download_extended_video(
-            port=req.port,
-            timeout=req.timeout,
-            output_dir=req.output_dir,
-        )
-        if result.get("success"):
-            return success_response(data=result, message="Video descargado")
-        return error_response(result.get("error", "Error desconocido"), 500, details=result)
-    except Exception as e:
-        return error_response(str(e), 500)
+    def _send():
+        try:
+            payload = _json.dumps({
+                "job_id": job_id,
+                "event": "image_ready",
+                "file_path": result.get("file_path", ""),
+                "file_name": result.get("file_name", ""),
+                "file_size": result.get("file_size", 0),
+                "image_url": result.get("image_url", ""),
+            }, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"[WARN] Webhook fallo ({url}): {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
