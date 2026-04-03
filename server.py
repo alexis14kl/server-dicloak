@@ -557,6 +557,7 @@ def veo3_extend_video(req: Veo3ExtendVideoRequest):
         return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)
+
 def _notify_webhook(url: str, job_id: str, result: dict) -> None:
     """Fire-and-forget: notifica al webhook sin bloquear el response."""
     if not url:
