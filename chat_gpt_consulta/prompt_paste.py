@@ -132,6 +132,24 @@ class ChatGPTSession:
                 pass
             self._ws = None
 
+    def _check_no_tokens(self) -> bool:
+        """Verifica si ChatGPT muestra error de tokens de imagen agotados."""
+        result = self.evaluate("""(() => {
+            const text = (document.body?.innerText || '').toLowerCase()
+                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+            const phrases = [
+                'has alcanzado tu limite de creacion de imagenes',
+                'el limite se restablece',
+                'youve hit the team plan limit for image generations',
+                'you can create more images when the limit resets',
+                'no pude invocar la herramienta de generacion de imagenes',
+                'cannot generate more images',
+                'image generation limit',
+            ];
+            return phrases.some(p => text.includes(p)) ? 'YES' : 'NO';
+        })()""")
+        return result == "YES"
+
     # ── Acciones de ChatGPT ──────────────────────────────────────────────
 
     def wait_for_page_ready(self, timeout_sec: int = 60) -> bool:

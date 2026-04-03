@@ -69,7 +69,10 @@ from platform_utils import (
     read_cdp_debug_info,
     write_cdp_debug_info,
 )
-from api import DICloakAPI
+try:
+    from api import DICloakAPI
+except ImportError:
+    DICloakAPI = None
 from logger import log_info, log_ok, log_warn
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -122,6 +125,8 @@ class DICloakService:
     def get_profiles(self) -> list[dict]:
         # Intentar primero via REST API (puerto 52140) — más fiable que scraping DOM
         try:
+            if DICloakAPI is None:
+                raise ImportError("api.py no disponible")
             api = DICloakAPI()
             profiles = api.list_profiles()
             if profiles:
