@@ -237,6 +237,15 @@ class Veo3StabilizeRequest(BaseModel):
     port: int
     timeout: int = 60
 
+class Veo3ExtendVideoRequest(BaseModel):
+    port: int
+    prompt: str
+
+class Veo3DownloadVideoRequest(BaseModel):
+    port: int
+    timeout: int = 600
+    output_dir: str = ""
+
 
 # ── Auto-launch ──────────────────────────────────────────────────────────────
 
@@ -294,6 +303,8 @@ def index():
             "POST /chatgpt/download-image",
             "POST /veo3/stabilize",
             "POST /veo3/new-project",
+            "POST /veo3/extend-video",
+            "POST /veo3/download-video",
         ],
     })
 
@@ -437,6 +448,32 @@ def chatgpt_download_image(req: ImageDownloadRequest):
         if result.get("success"):
             return success_response(data=result, message="Imagen descargada")
         return error_response(result.get("error", "Error desconocido"), 500)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+@app.post("/veo3/extend-video")
+def veo3_extend_video(req: Veo3ExtendVideoRequest):
+    try:
+        from chat_veo3_videos.exten_video import extend_video
+        result = extend_video(port=req.port, prompt=req.prompt)
+        if result.get("success"):
+            return success_response(data=result, message="Prompt de extension enviado")
+        return error_response(result.get("error", "Error desconocido"), 500, details=result)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+@app.post("/veo3/download-video")
+def veo3_download_video(req: Veo3DownloadVideoRequest):
+    try:
+        from chat_veo3_videos.exten_video import download_extended_video
+        result = download_extended_video(
+            port=req.port,
+            timeout=req.timeout,
+            output_dir=req.output_dir,
+        )
+        if result.get("success"):
+            return success_response(data=result, message="Video descargado")
+        return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 
