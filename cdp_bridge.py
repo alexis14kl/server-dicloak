@@ -315,6 +315,33 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
     _ensure_on_profile_list(port)
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
+    # Paso 1: Buscar la fila y hacer scroll para que DICloak renderice el boton
+    scroll_js = f"""(() => {{
+        try {{
+            const targetName = "{safe_name}".toLowerCase().trim();
+            const rows = document.querySelectorAll('.el-table__row');
+            for (const row of rows) {{
+                const cells = Array.from(row.querySelectorAll('td'));
+                const match = cells.some(c => {{
+                    const t = (c.textContent || '').trim().toLowerCase();
+                    return t.length > 1 && (t === targetName || t.includes(targetName) || targetName.includes(t));
+                }});
+                if (match) {{
+                    row.scrollIntoView({{block: 'center'}});
+                    return 'SCROLLED';
+                }}
+            }}
+            return 'NOT_FOUND';
+        }} catch(e) {{ return 'ERROR: ' + e.message; }}
+    }})()"""
+    scroll_result = cdp_evaluate_sync(scroll_js, port, timeout=5)
+    if scroll_result and "NOT_FOUND" in str(scroll_result):
+        log_warn(f"Perfil '{profile_name}' no encontrado en la tabla")
+
+    import time as _time2
+    _time2.sleep(1)  # Esperar renderizado del boton despues del scroll
+
+    # Paso 2: Buscar fila + click en boton Abrir
     open_js = f"""(() => {{
         try {{
             const targetName = "{safe_name}".toLowerCase().trim();
@@ -351,9 +378,22 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
             }});
             if (verBtn) return 'ZOMBIE_STATE';
 
-            return 'NO_OPEN_BUTTON';
+            return 'NO_OPEN_BUTTON: ' + buttons.map(b => (b.innerText||'').trim()).join(', ');
         }} catch(e) {{ return 'ERROR: ' + e.message; }}
     }})()"""
+
+    # Debug: listar perfiles y sus botones antes de intentar
+    debug = cdp_evaluate_sync("""(() => {
+        const rows = document.querySelectorAll('.el-table__row');
+        return JSON.stringify(Array.from(rows).slice(0, 10).map(row => {
+            const cells = Array.from(row.querySelectorAll('td'));
+            const texts = cells.map(c => (c.textContent || '').trim()).filter(t => t.length > 1);
+            const btns = Array.from(row.querySelectorAll('button, a, .el-button'));
+            const btnTexts = btns.map(b => (b.innerText || b.textContent || '').trim()).filter(t => t);
+            return {name: texts.slice(0, 3), buttons: btnTexts};
+        }));
+    })()""", port, timeout=5)
+    log_info(f"Perfiles en tabla: {debug}")
 
     result = cdp_evaluate_sync(open_js, port, timeout=5)
     log_info(f"open_profile result: {result}")
