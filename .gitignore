@@ -38,3 +38,6 @@ Desktop.ini
 
 # Screenshots from tests
 resource_claude_cdp/screenshots/
+
+# State files
+.account_rotation_state.json
