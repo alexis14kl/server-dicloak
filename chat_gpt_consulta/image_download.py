@@ -125,6 +125,24 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
 
+    # Verificación inicial: ¿hay algo generándose o ya generado?
+    no_activity_count = 0
+    max_idle_checks = 3  # ~3 segundos sin actividad → abortar
+    for _ in range(max_idle_checks):
+        initial = _check_image_state(session)
+        initial_status = initial.get("status", "")
+        if initial_status in ("GENERATING", "LOADING", "READY", "COMPARISON_RESOLVED"):
+            log_info(f"Actividad detectada: {initial_status}")
+            break
+        if session._check_no_tokens():
+            log_warn("Tokens agotados — no hay imagen que esperar")
+            return ""
+        no_activity_count += 1
+        if no_activity_count >= max_idle_checks:
+            log_warn("No hay imagen generándose en ChatGPT. Abortando espera.")
+            return ""
+        time.sleep(1)
+
     stable_url = ""
     stable_count = 0
     token_check_counter = 0
