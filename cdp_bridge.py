@@ -169,14 +169,36 @@ def cdp_evaluate_sync(expression: str, port: int = DEFAULT_DICLOAK_PORT, timeout
 
 # ── Profile Operations via CDP ───────────────────────────────────────────────
 
+def _ensure_on_profile_list(port: int = DEFAULT_DICLOAK_PORT) -> bool:
+    """Navega a la lista de perfiles si DICloak está en otra página."""
+    check_js = "location.hash.includes('envList') || location.hash.includes('environment')"
+    result = cdp_evaluate_sync(check_js, port)
+    if result == "true":
+        return True
+
+    nav_js = """(() => {
+        const item = Array.from(document.querySelectorAll('.el-menu-item'))
+            .find(el => el.textContent.includes('Perfiles') || el.textContent.includes('Profile'));
+        if (item) { item.click(); return 'clicked'; }
+        location.hash = '#/environment/envList';
+        return 'navigated';
+    })()"""
+    cdp_evaluate_sync(nav_js, port, timeout=5)
+    import time
+    time.sleep(2)
+    return True
+
+
 def list_profiles_via_cdp(port: int = DEFAULT_DICLOAK_PORT) -> list[ProfileInfo]:
+    _ensure_on_profile_list(port)
+
     js = """(() => {
         try {
             const rows = document.querySelectorAll('.el-table__row');
             const profiles = [];
             rows.forEach(row => {
-                const cells = Array.from(row.querySelectorAll('td .cell'));
-                const texts = cells.map(c => (c.innerText || '').trim()).filter(t => t.length > 1);
+                const cells = Array.from(row.querySelectorAll('td'));
+                const texts = cells.map(c => (c.textContent || '').trim()).filter(t => t.length > 1);
                 // Nombre perfil = primera celda que contiene letras (no solo numeros)
                 const name = texts.find(t => /[a-zA-Z]/.test(t)) || '';
                 if (name) {
@@ -245,9 +267,81 @@ def inject_cdp_hook(port: int = DEFAULT_DICLOAK_PORT) -> bool:
     return result is not None and "INSTALLED" in str(result).upper()
 
 
+def _close_zombie_profiles_via_cdp(port: int = DEFAULT_DICLOAK_PORT) -> None:
+    """Cierra perfiles zombie (muestran 'Ver' pero no tienen proceso vivo).
+    Selecciona todos los perfiles con 'Ver' y simula cierre via taskkill + reload de tabla.
+    """
+    import subprocess, sys as _sys
+
+    # Matar cualquier ginsbrowser residual
+    try:
+        if _sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/IM", "ginsbrowser.exe"],
+                           capture_output=True, timeout=5)
+        else:
+            subprocess.run(["pkill", "-f", "ginsbrowser"],
+                           capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+    import time as _time
+    _time.sleep(2)
+
+    # Forzar recarga de la tabla de perfiles para que DICloak sincronice estado
+    # Navegar fuera y volver limpia el cache del componente Vue
+    cdp_evaluate_sync("location.hash = '#/personalInfo'", port, timeout=3)
+    _time.sleep(2)
+    _ensure_on_profile_list(port)
+    _time.sleep(3)
+
+    # Verificar si queda algún 'Ver'
+    check = cdp_evaluate_sync("""(() => {
+        const rows = document.querySelectorAll('.el-table__row');
+        let zombie = 0;
+        for (const row of rows) {
+            const btns = Array.from(row.querySelectorAll('button'));
+            if (btns.some(b => (b.textContent||'').trim() === 'Ver')) zombie++;
+        }
+        return String(zombie);
+    })()""", port, timeout=5)
+
+    if check and int(check or "0") > 0:
+        log_warn(f"Aún hay {check} perfil(es) zombie después de limpiar.")
+    else:
+        log_ok("Perfiles zombie limpiados")
+
+
 def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) -> bool:
+    _ensure_on_profile_list(port)
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
+    # Paso 1: Buscar la fila y hacer scroll para que DICloak renderice el boton
+    scroll_js = f"""(() => {{
+        try {{
+            const targetName = "{safe_name}".toLowerCase().trim();
+            const rows = document.querySelectorAll('.el-table__row');
+            for (const row of rows) {{
+                const cells = Array.from(row.querySelectorAll('td'));
+                const match = cells.some(c => {{
+                    const t = (c.textContent || '').trim().toLowerCase();
+                    return t.length > 1 && (t === targetName || t.includes(targetName) || targetName.includes(t));
+                }});
+                if (match) {{
+                    row.scrollIntoView({{block: 'center'}});
+                    return 'SCROLLED';
+                }}
+            }}
+            return 'NOT_FOUND';
+        }} catch(e) {{ return 'ERROR: ' + e.message; }}
+    }})()"""
+    scroll_result = cdp_evaluate_sync(scroll_js, port, timeout=5)
+    if scroll_result and "NOT_FOUND" in str(scroll_result):
+        log_warn(f"Perfil '{profile_name}' no encontrado en la tabla")
+
+    import time as _time2
+    _time2.sleep(1)  # Esperar renderizado del boton despues del scroll
+
+    # Paso 2: Buscar fila + click en boton Abrir
     open_js = f"""(() => {{
         try {{
             const targetName = "{safe_name}".toLowerCase().trim();
@@ -255,9 +349,9 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
             let targetRow = null;
 
             for (const row of rows) {{
-                const cells = Array.from(row.querySelectorAll('td .cell'));
+                const cells = Array.from(row.querySelectorAll('td'));
                 const match = cells.some(c => {{
-                    const t = (c.innerText || '').trim().toLowerCase();
+                    const t = (c.textContent || '').trim().toLowerCase();
                     return t.length > 1 && (t === targetName || t.includes(targetName) || targetName.includes(t));
                 }});
                 if (match) {{
@@ -269,29 +363,59 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
             if (!targetRow) return 'PROFILE_NOT_FOUND';
 
             const buttons = Array.from(targetRow.querySelectorAll('button, a, [role="button"], .el-button'));
+
+            // Buscar botón "Abrir"
             const openBtn = buttons.find(b => {{
                 const text = (b.innerText || b.textContent || '').trim().toLowerCase();
                 return text === 'abrir' || text === 'open' || text === 'launch' || text === 'iniciar';
             }});
-
             if (openBtn) {{ openBtn.click(); return 'CLICKED_OPEN'; }}
 
-            const fallbackBtn = buttons.find(b => {{
+            // Si el botón dice "Ver", el perfil está en estado zombie
+            const verBtn = buttons.find(b => {{
                 const text = (b.innerText || '').trim().toLowerCase();
-                return text !== '' && text !== 'select' && !b.querySelector('input[type="checkbox"]');
+                return text === 'ver' || text === 'view';
             }});
+            if (verBtn) return 'ZOMBIE_STATE';
 
-            if (fallbackBtn) {{ fallbackBtn.click(); return 'CLICKED_FALLBACK'; }}
-            return 'NO_OPEN_BUTTON';
+            return 'NO_OPEN_BUTTON: ' + buttons.map(b => (b.innerText||'').trim()).join(', ');
         }} catch(e) {{ return 'ERROR: ' + e.message; }}
     }})()"""
+
+    # Debug: listar perfiles y sus botones antes de intentar
+    debug = cdp_evaluate_sync("""(() => {
+        const rows = document.querySelectorAll('.el-table__row');
+        return JSON.stringify(Array.from(rows).slice(0, 10).map(row => {
+            const cells = Array.from(row.querySelectorAll('td'));
+            const texts = cells.map(c => (c.textContent || '').trim()).filter(t => t.length > 1);
+            const btns = Array.from(row.querySelectorAll('button, a, .el-button'));
+            const btnTexts = btns.map(b => (b.innerText || b.textContent || '').trim()).filter(t => t);
+            return {name: texts.slice(0, 3), buttons: btnTexts};
+        }));
+    })()""", port, timeout=5)
+    log_info(f"Perfiles en tabla: {debug}")
 
     result = cdp_evaluate_sync(open_js, port, timeout=5)
     log_info(f"open_profile result: {result}")
 
-    if result and "CLICKED" in str(result):
+    if result and "CLICKED_OPEN" in str(result):
         log_ok(f"Perfil '{profile_name}' abierto via CDP")
         return True
+
+    if result and "ZOMBIE" in str(result):
+        log_warn(f"Perfil '{profile_name}' en estado zombie. Limpiando y reintentando...")
+        _close_zombie_profiles_via_cdp(port)
+        inject_cdp_hook(port)
+
+        # Reintentar el click después de limpiar zombies
+        _ensure_on_profile_list(port)
+        result2 = cdp_evaluate_sync(open_js, port, timeout=5)
+        log_info(f"open_profile retry result: {result2}")
+        if result2 and "CLICKED_OPEN" in str(result2):
+            log_ok(f"Perfil '{profile_name}' abierto via CDP (tras limpieza)")
+            return True
+        log_warn(f"Perfil '{profile_name}' sigue sin abrirse: {result2}")
+        return False
 
     log_warn(f"No se pudo abrir perfil '{profile_name}': {result}")
     return False

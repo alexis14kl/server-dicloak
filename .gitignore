@@ -1,3 +1,6 @@
+# Claude
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -26,6 +29,7 @@ coleccion_api/
 .env
 .venv/
 venv/
+env/
 
 # OS
 Thumbs.db

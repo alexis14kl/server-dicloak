@@ -468,7 +468,10 @@ def open_new_project(port: int, prompt: str = "") -> dict:
         # Click en "New project"
         result = session.evaluate("""(() => {
             const btns = Array.from(document.querySelectorAll('button'));
-            const newBtn = btns.find(b => (b.innerText || '').toLowerCase().includes('new project'));
+            const newBtn = btns.find(b => {
+                const text = (b.innerText || '').toLowerCase();
+                return text.includes('new project') || text.includes('nuevo proyecto');
+            });
             if (newBtn) {
                 newBtn.click();
                 return 'CLICKED';
