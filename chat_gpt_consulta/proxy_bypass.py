@@ -162,26 +162,17 @@ def create_direct_chatgpt_tab(port: int, timeout: int = 15) -> Optional[str]:
                 return resp
 
     try:
-        # 1. Crear BrowserContext sin proxy
-        r = cdp("Target.createBrowserContext", {"proxyServer": ""})
-        if not r.get("result"):
-            log_error(f"createBrowserContext fallo: {r.get('error', {})}")
-            return None
-
-        ctx_id = r["result"]["browserContextId"]
-        log_info(f"BrowserContext sin proxy creado: {ctx_id}")
-
-        # 2. Crear tab en ese contexto
+        # Crear tab en el contexto default (comparte sesion/cookies de ChatGPT)
+        # No usar createBrowserContext — eso crea ventana aislada sin cookies
         r = cdp("Target.createTarget", {
             "url": "https://chatgpt.com/",
-            "browserContextId": ctx_id,
         })
         if not r.get("result"):
             log_error(f"createTarget fallo: {r.get('error', {})}")
             return None
 
         target_id = r["result"]["targetId"]
-        log_ok(f"Tab ChatGPT sin proxy creada: {target_id}")
+        log_ok(f"Tab ChatGPT creada en contexto default: {target_id}")
 
         # 3. Esperar a que cargue
         time.sleep(timeout)
