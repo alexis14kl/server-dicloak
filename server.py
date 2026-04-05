@@ -328,6 +328,7 @@ class ImageDownloadRequest(BaseModel):
     timeout: int = 300
     webhook_url: str = ""
     job_id: str = ""
+    target_ws: str = ""
 
 class Veo3StabilizeRequest(BaseModel):
     port: int
@@ -576,6 +577,7 @@ def chatgpt_download_image(req: ImageDownloadRequest):
             port=req.port,
             output_dir=str(IMAGES_DIR),
             timeout=req.timeout,
+            target_ws=req.target_ws,
         )
         if result.get("success"):
             # Agregar URL HTTP servible por este servidor

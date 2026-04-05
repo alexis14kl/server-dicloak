@@ -1,1 +1,1 @@
-fix: bajar threshold de imagen final de 800KB a 200KB para aceptar imagenes legitimas
+feat: target_ws - prompt retorna WS de la tab, download se conecta directo sin buscar

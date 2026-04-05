@@ -653,6 +653,7 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True, ti
             "port": port,
             "prompt_length": len(prompt),
             "sent": True,
+            "target_ws": session.ws_url,
         }
 
         # Esperar respuesta si se pidió
@@ -722,6 +723,7 @@ def paste_and_send_with_rotation(
                     "prompt_length": len(prompt),
                     "sent": True,
                     "rotations": rotations,
+                    "target_ws": session.ws_url,
                 }
                 if wait_response:
                     result["response"] = session.get_last_response()

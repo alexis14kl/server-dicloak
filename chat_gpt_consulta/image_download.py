@@ -361,20 +361,34 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
     return ""
 
 
-def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300) -> dict:
+def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
+                            target_ws: str = "") -> dict:
     """Espera la imagen generada y la descarga.
 
     Args:
         port: Puerto CDP del navegador con ChatGPT
         output_dir: Directorio de salida (default: ~/dicloak_images)
         timeout: Timeout en segundos para esperar la imagen
+        target_ws: WebSocket URL exacta de la tab donde se envio el prompt.
+                   Si se pasa, se conecta directo a esa tab sin buscar.
 
     Returns:
         dict con status, file_path, file_size, image_url
     """
     session = ChatGPTSession(port=port)
 
-    if not session.connect():
+    if target_ws:
+        # Conectar directo a la tab que genero la imagen
+        session.ws_url = target_ws
+        try:
+            import websockets.sync.client as ws_sync
+            session._ws = ws_sync.connect(target_ws, max_size=2**22)
+            log_ok(f"Conectado directo a tab del prompt: {target_ws[-40:]}")
+        except Exception as e:
+            log_warn(f"No se pudo conectar a target_ws, buscando tab: {e}")
+            if not session.connect():
+                return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+    elif not session.connect():
         return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
 
     try:
