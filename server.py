@@ -168,7 +168,7 @@ class DICloakService:
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde. Verifica que este abierto.")
 
-        # Reutilizar perfil abierto si CDP activo
+        # Estrategia 1: Reutilizar via cdp_debug_info.json
         data = read_cdp_debug_info()
         for entry in data.values():
             if not isinstance(entry, dict):
@@ -182,6 +182,20 @@ class DICloakService:
                     "name": name,
                     "debug_port": port,
                     "ws_url": str(entry.get("webSocketUrl") or ""),
+                    "cdp_active": True,
+                }
+
+        # Estrategia 2: Detectar ginsbrowser ya corriendo con CDP activo
+        # (cdp_debug_info.json puede estar vacio/desactualizado)
+        running = self.get_running_profiles()
+        for p in running:
+            rport = p.get("debug_port", 0)
+            if rport and p.get("cdp_active"):
+                log_ok(f"Perfil ya abierto detectado via proceso — CDP puerto {rport}")
+                return {
+                    "name": name,
+                    "debug_port": rport,
+                    "ws_url": "",
                     "cdp_active": True,
                 }
 
