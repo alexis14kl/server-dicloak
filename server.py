@@ -199,61 +199,62 @@ class DICloakService:
                     "cdp_active": True,
                 }
 
-        clicked = open_profile_via_cdp(name, self.port)
-        if not clicked:
+        # Intentar abrir el perfil via CDP (click en DiCloak UI)
+        status = open_profile_via_cdp(name, self.port)
+
+        if status == "PROFILE_NOT_FOUND":
             available = [p.name for p in list_profiles_via_cdp(self.port)]
             raise FileNotFoundError(
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
-        # Esperar a que DiCloak escriba el puerto en cdp_debug_info.json
+        # Si el perfil ya esta abierto (Ver/Abriendo), buscar su CDP directo
+        if status == "ALREADY_OPEN":
+            log_info(f"Perfil '{name}' ya abierto — buscando CDP...")
+            port = self._wait_for_cdp_port(timeout)
+            if port:
+                return {"name": name, "debug_port": port, "ws_url": "",
+                        "cdp_active": True}
+            # Ya abierto pero sin CDP — reinyectar hook y esperar
+            log_warn("Perfil abierto sin CDP — reinyectando hook...")
+            try:
+                inject_cdp_hook(self.port)
+                time.sleep(3)
+            except Exception:
+                pass
+            port = self._wait_for_cdp_port(min(timeout, 20))
+            if port:
+                return {"name": name, "debug_port": port, "ws_url": "",
+                        "cdp_active": True}
+            return {"name": name, "debug_port": 0, "ws_url": "",
+                    "cdp_active": False, "clicked": False}
+
+        # CLICKED_OPEN — se hizo click, esperar CDP
         port = self._wait_for_cdp_port(timeout)
         if port:
-            return {
-                "name": name,
-                "debug_port": port,
-                "ws_url": "",
-                "cdp_active": True,
-                "clicked": True,
-            }
+            return {"name": name, "debug_port": port, "ws_url": "",
+                    "cdp_active": True, "clicked": True}
 
-        # Sin CDP: el hook se perdio (DiCloak fue reiniciado).
-        # Reinyectar hook, cerrar el perfil sin CDP y reabrirlo.
-        log_warn("CDP no disponible tras abrir perfil — reinyectando hook y reabriendo...")
+        # Sin CDP tras abrir: hook perdido. Reinyectar + cerrar + reabrir.
+        log_warn("CDP no disponible tras abrir — reinyectando hook y reabriendo...")
         try:
             inject_cdp_hook(self.port)
             time.sleep(2)
-        except Exception:
-            pass
-
-        # Cerrar el perfil que se abrio sin CDP
-        try:
             self.close_profiles()
             time.sleep(3)
         except Exception:
             pass
 
-        # Reabrir con el hook ya activo
-        clicked2 = open_profile_via_cdp(name, self.port)
-        if clicked2:
+        status2 = open_profile_via_cdp(name, self.port)
+        if status2 in ("CLICKED_OPEN", "ALREADY_OPEN"):
             port2 = self._wait_for_cdp_port(timeout)
             if port2:
-                log_ok(f"CDP activo tras reinyeccion de hook — puerto {port2}")
-                return {
-                    "name": name,
-                    "debug_port": port2,
-                    "ws_url": "",
-                    "cdp_active": True,
-                    "clicked": True,
-                }
+                log_ok(f"CDP activo tras reinyeccion — puerto {port2}")
+                return {"name": name, "debug_port": port2, "ws_url": "",
+                        "cdp_active": True, "clicked": True}
 
-        return {
-            "name": name,
-            "debug_port": 0,
-            "ws_url": "",
-            "cdp_active": False,
-            "clicked": True,
-        }
+        return {"name": name, "debug_port": 0, "ws_url": "",
+                "cdp_active": False, "clicked": True}
 
     def _wait_for_cdp_port(self, timeout: int) -> int:
         """Espera a que aparezca un puerto CDP activo. Retorna puerto o 0."""

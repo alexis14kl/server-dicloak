@@ -1,0 +1,1 @@
+fix: open_profile maneja estados Ver/Abriendo sin fallar + cdp_bridge robusto

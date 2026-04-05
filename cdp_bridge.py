@@ -301,7 +301,15 @@ def _close_zombie_profiles_via_cdp(port: int = DEFAULT_DICLOAK_PORT) -> None:
         log_ok("Perfiles zombie limpiados")
 
 
-def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) -> bool:
+def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) -> str:
+    """Abre un perfil en DiCloak via CDP.
+
+    Retorna:
+        'CLICKED_OPEN' — se hizo click en Abrir
+        'ALREADY_OPEN' — perfil ya abierto (boton Ver/Abriendo)
+        'PROFILE_NOT_FOUND' — no se encontro el perfil
+        'NO_OPEN_BUTTON: ...' — no hay boton reconocido
+    """
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
     open_js = f"""(() => {{
@@ -322,24 +330,40 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
             if (!targetRow) return 'PROFILE_NOT_FOUND';
 
             const buttons = Array.from(targetRow.querySelectorAll('button, a, [role="button"], .el-button'));
-            const openBtn = buttons.find(b => {{
-                const text = (b.innerText || b.textContent || '').trim().toLowerCase();
-                return text === 'abrir' || text === 'open' || text === 'launch' || text === 'iniciar';
-            }});
-            if (openBtn) {{ openBtn.click(); return 'CLICKED_OPEN'; }}
+            const btnTexts = buttons.map(b => (b.innerText || b.textContent || '').trim().toLowerCase());
 
-            return 'NO_OPEN_BUTTON: ' + buttons.map(b => (b.innerText||'').trim()).join(', ');
+            // 1. Boton "Abrir" — perfil cerrado, hay que abrirlo
+            const openIdx = btnTexts.findIndex(t => t === 'abrir' || t === 'open' || t === 'launch' || t === 'iniciar');
+            if (openIdx >= 0) {{ buttons[openIdx].click(); return 'CLICKED_OPEN'; }}
+
+            // 2. Boton "Ver" — perfil ya abierto
+            const viewIdx = btnTexts.findIndex(t => t === 'ver' || t === 'view');
+            if (viewIdx >= 0) return 'ALREADY_OPEN';
+
+            // 3. Boton "Abriendo" — perfil en proceso de abrir
+            const openingIdx = btnTexts.findIndex(t => t === 'abriendo' || t === 'abriendo...' || t === 'opening' || t === 'loading');
+            if (openingIdx >= 0) return 'ALREADY_OPEN';
+
+            return 'NO_OPEN_BUTTON: ' + btnTexts.join(', ');
         }} catch(e) {{ return 'ERROR: ' + e.message; }}
     }})()"""
 
-    result = cdp_evaluate_sync(open_js, port, timeout=5)
+    result = str(cdp_evaluate_sync(open_js, port, timeout=5) or "")
 
-    if result and "CLICKED_OPEN" in str(result):
+    if "CLICKED_OPEN" in result:
         log_ok(f"Perfil '{profile_name}' abierto via CDP")
-        return True
+        return "CLICKED_OPEN"
+
+    if "ALREADY_OPEN" in result:
+        log_info(f"Perfil '{profile_name}' ya esta abierto")
+        return "ALREADY_OPEN"
+
+    if "PROFILE_NOT_FOUND" in result:
+        log_warn(f"Perfil '{profile_name}' no encontrado en la lista")
+        return "PROFILE_NOT_FOUND"
 
     log_warn(f"No se pudo abrir perfil '{profile_name}': {result}")
-    return False
+    return result
 
 
 def detect_ginsbrowser_port(timeout_sec: int = 60) -> int:
