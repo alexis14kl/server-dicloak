@@ -296,9 +296,10 @@ def _download_with_cdp(session: ChatGPTSession, image_url: str, output_path: Pat
     return True
 
 
-# Tamaño mínimo para considerar una imagen como final de DALL-E (no preview).
-# DALL-E 1024x1536 genera imágenes de 1.5-3MB. Previews progresivos pesan 100-500KB.
-_MIN_FINAL_IMAGE_SIZE = 800_000  # 800KB
+# Tamaño mínimo para considerar una imagen como final (no preview borroso).
+# ChatGPT genera imágenes de 200KB-3MB dependiendo del contenido.
+# Previews borrosos pesan < 100KB. Imágenes reales >= 200KB.
+_MIN_FINAL_IMAGE_SIZE = 200_000  # 200KB
 
 
 def download_image(session: ChatGPTSession, image_url: str, output_dir: str = "") -> str:

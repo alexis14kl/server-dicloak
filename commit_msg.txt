@@ -1,1 +1,1 @@
-fix: conectar a la ultima tab de ChatGPT (no la primera) para detectar imagen generada
+fix: bajar threshold de imagen final de 800KB a 200KB para aceptar imagenes legitimas
