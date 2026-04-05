@@ -1,1 +1,1 @@
-feat: target_ws - prompt retorna WS de la tab, download se conecta directo sin buscar
+fix: deteccion de imagen mas robusta + no abortar espera prematuramente

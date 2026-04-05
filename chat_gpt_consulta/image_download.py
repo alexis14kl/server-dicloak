@@ -57,40 +57,44 @@ def _check_image_state(session: ChatGPTSession) -> dict:
 
         // Verificar si todavía está generando
         const stop = document.querySelector('button[data-testid="stop-button"]')
-            || document.querySelector('button[aria-label="Stop generating"]');
+            || document.querySelector('button[aria-label="Stop generating"]')
+            || document.querySelector('button[aria-label="Detener la generación"]');
         if (stop) {
             return JSON.stringify({status: 'GENERATING'});
         }
 
-        // Generación terminada — buscar imagen
+        // Generación terminada — buscar imagen en los ultimos bloques del chat
         const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
         const messages = Array.from(document.querySelectorAll('[data-message-id]'));
         const articles = Array.from(document.querySelectorAll('article'));
         const allBlocks = turns.length > 0 ? turns : messages.length > 0 ? messages : articles;
-        const candidates = allBlocks.slice(-2).reverse();
+        const candidates = allBlocks.slice(-3).reverse();
 
         for (const block of candidates) {
-            const hasDownload = Array.from(block.querySelectorAll('button,[role="button"],a'))
-                .some(el => /descargar esta imagen|download this image/i.test(
-                    (el.innerText || el.getAttribute('aria-label') || '').trim()
-                ));
-            const hasOverlay = !!block.querySelector('[data-testid="image-gen-overlay-actions"]');
-            const hasCreatedText = /imagen creada|image created/i.test(block.innerText || '');
+            // Buscar CUALQUIER imagen grande (no solo /backend-api/)
+            const imgs = Array.from(block.querySelectorAll('img')).filter(img => {
+                const src = img.currentSrc || img.src || '';
+                const w = img.naturalWidth || 0;
+                // Filtrar: imagenes de contenido (no avatars, iconos, logos)
+                if (w < 100) return false;
+                if (src.includes('avatar') || src.includes('icon')) return false;
+                // Aceptar URLs de ChatGPT backend, oaidalleapiprodscus, etc.
+                if (src.includes('/backend-api/') || src.includes('oaidalleapi') ||
+                    src.includes('openai.com') || src.includes('chatgpt.com') ||
+                    src.includes('blob:') || w >= 512) return true;
+                return false;
+            });
 
-            if (hasDownload || hasOverlay || hasCreatedText) {
-                const imgs = Array.from(block.querySelectorAll('img'))
-                    .filter(img => (img.currentSrc || img.src || '').includes('/backend-api/'));
-                if (imgs.length > 0) {
-                    const img = imgs[imgs.length - 1];
-                    const url = img.currentSrc || img.src;
-                    const w = img.naturalWidth || 0;
-                    const h = img.naturalHeight || 0;
-                    const complete = img.complete === true;
-                    return JSON.stringify({
-                        status: (w > 512 && complete) ? 'READY' : 'LOADING',
-                        url, width: w, height: h, complete
-                    });
-                }
+            if (imgs.length > 0) {
+                const img = imgs[imgs.length - 1];
+                const url = img.currentSrc || img.src;
+                const w = img.naturalWidth || 0;
+                const h = img.naturalHeight || 0;
+                const complete = img.complete === true;
+                return JSON.stringify({
+                    status: (w >= 512 && complete) ? 'READY' : 'LOADING',
+                    url, width: w, height: h, complete
+                });
             }
         }
 
@@ -125,10 +129,10 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
 
-    # Verificación inicial: ¿hay algo generándose o ya generado?
-    no_activity_count = 0
-    max_idle_checks = 3  # ~3 segundos sin actividad → abortar
-    for _ in range(max_idle_checks):
+    # Verificación inicial: esperar hasta 30s a que aparezca actividad
+    # (ChatGPT puede tardar en empezar a generar o ya haber terminado)
+    initial_deadline = time.time() + 30
+    while time.time() < initial_deadline:
         initial = _check_image_state(session)
         initial_status = initial.get("status", "")
         if initial_status in ("GENERATING", "LOADING", "READY", "COMPARISON_RESOLVED"):
@@ -137,11 +141,10 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
         if session._check_no_tokens():
             log_warn("Tokens agotados — no hay imagen que esperar")
             return ""
-        no_activity_count += 1
-        if no_activity_count >= max_idle_checks:
-            log_warn("No hay imagen generándose en ChatGPT. Abortando espera.")
-            return ""
-        time.sleep(1)
+        time.sleep(2)
+    else:
+        log_warn("Sin actividad de imagen en 30s. Continuando espera por si acaso...")
+        # No abortar — seguir al loop principal por si la imagen aparece tarde
 
     stable_url = ""
     stable_count = 0
