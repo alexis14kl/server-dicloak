@@ -1,1 +1,1 @@
-fix: deteccion de imagen mas robusta + no abortar espera prematuramente
+fix: reconocer boton cerrar/close como perfil ya abierto

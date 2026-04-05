@@ -336,13 +336,13 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
             const openIdx = btnTexts.findIndex(t => t === 'abrir' || t === 'open' || t === 'launch' || t === 'iniciar');
             if (openIdx >= 0) {{ buttons[openIdx].click(); return 'CLICKED_OPEN'; }}
 
-            // 2. Boton "Ver" — perfil ya abierto
-            const viewIdx = btnTexts.findIndex(t => t === 'ver' || t === 'view');
-            if (viewIdx >= 0) return 'ALREADY_OPEN';
-
-            // 3. Boton "Abriendo" — perfil en proceso de abrir
-            const openingIdx = btnTexts.findIndex(t => t === 'abriendo' || t === 'abriendo...' || t === 'opening' || t === 'loading');
-            if (openingIdx >= 0) return 'ALREADY_OPEN';
+            // 2. Perfil ya abierto — cualquier indicador (Ver, Cerrar, Abriendo, etc.)
+            const alreadyOpen = btnTexts.findIndex(t =>
+                t === 'ver' || t === 'view' ||
+                t === 'cerrar' || t === 'close' ||
+                t === 'abriendo' || t === 'abriendo...' || t === 'opening' || t === 'loading'
+            );
+            if (alreadyOpen >= 0) return 'ALREADY_OPEN';
 
             return 'NO_OPEN_BUTTON: ' + btnTexts.join(', ');
         }} catch(e) {{ return 'ERROR: ' + e.message; }}
