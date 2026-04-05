@@ -207,8 +207,59 @@ class DICloakService:
             )
 
         # Esperar a que DiCloak escriba el puerto en cdp_debug_info.json
+        port = self._wait_for_cdp_port(timeout)
+        if port:
+            return {
+                "name": name,
+                "debug_port": port,
+                "ws_url": "",
+                "cdp_active": True,
+                "clicked": True,
+            }
+
+        # Sin CDP: el hook se perdio (DiCloak fue reiniciado).
+        # Reinyectar hook, cerrar el perfil sin CDP y reabrirlo.
+        log_warn("CDP no disponible tras abrir perfil — reinyectando hook y reabriendo...")
+        try:
+            inject_cdp_hook(self.port)
+            time.sleep(2)
+        except Exception:
+            pass
+
+        # Cerrar el perfil que se abrio sin CDP
+        try:
+            self.close_profiles()
+            time.sleep(3)
+        except Exception:
+            pass
+
+        # Reabrir con el hook ya activo
+        clicked2 = open_profile_via_cdp(name, self.port)
+        if clicked2:
+            port2 = self._wait_for_cdp_port(timeout)
+            if port2:
+                log_ok(f"CDP activo tras reinyeccion de hook — puerto {port2}")
+                return {
+                    "name": name,
+                    "debug_port": port2,
+                    "ws_url": "",
+                    "cdp_active": True,
+                    "clicked": True,
+                }
+
+        return {
+            "name": name,
+            "debug_port": 0,
+            "ws_url": "",
+            "cdp_active": False,
+            "clicked": True,
+        }
+
+    def _wait_for_cdp_port(self, timeout: int) -> int:
+        """Espera a que aparezca un puerto CDP activo. Retorna puerto o 0."""
         deadline = time.time() + min(timeout, 30)
         while time.time() < deadline:
+            # Via cdp_debug_info.json
             data = read_cdp_debug_info()
             for entry in data.values():
                 if not isinstance(entry, dict):
@@ -218,21 +269,15 @@ class DICloakService:
                 except (TypeError, ValueError):
                     continue
                 if port and _test_cdp_port(port):
-                    return {
-                        "name": name,
-                        "debug_port": port,
-                        "ws_url": str(entry.get("webSocketUrl") or ""),
-                        "cdp_active": True,
-                    }
+                    return port
+            # Via proceso (fallback)
+            running = self.get_running_profiles()
+            for p in running:
+                rport = p.get("debug_port", 0)
+                if rport and p.get("cdp_active"):
+                    return rport
             time.sleep(0.5)
-
-        return {
-            "name": name,
-            "debug_port": 0,
-            "ws_url": "",
-            "cdp_active": False,
-            "clicked": True,
-        }
+        return 0
 
     def close_profiles(self) -> int:
         try:
@@ -451,10 +496,16 @@ def inject_hook():
 @app.post("/chatgpt/prompt")
 def chatgpt_prompt(req: PromptRequest):
     try:
+        # Verificar proxy y crear tab sin proxy si es necesario
+        from chat_gpt_consulta.proxy_bypass import ensure_chatgpt_reachable
+        port = ensure_chatgpt_reachable(req.port)
+        if not port:
+            return error_response("Proxy muerto y no se pudo crear bypass", 503)
+
         if req.auto_rotate:
             from chat_gpt_consulta.prompt_paste import paste_and_send_with_rotation
             result = paste_and_send_with_rotation(
-                port=req.port,
+                port=port,
                 prompt=req.prompt,
                 wait_response=req.wait_response,
                 timeout=req.timeout,
@@ -462,7 +513,7 @@ def chatgpt_prompt(req: PromptRequest):
         else:
             from chat_gpt_consulta.prompt_paste import paste_and_send_prompt
             result = paste_and_send_prompt(
-                port=req.port,
+                port=port,
                 prompt=req.prompt,
                 wait_response=req.wait_response,
                 timeout=req.timeout,
