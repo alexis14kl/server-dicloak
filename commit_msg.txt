@@ -1,1 +1,1 @@
-fix: crear tab en contexto default para compartir sesion ChatGPT, no BrowserContext aislado
+fix: subir tiempos de espera para evitar descargar imagen borrosa (11s total)
