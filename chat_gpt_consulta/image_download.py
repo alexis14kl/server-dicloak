@@ -110,8 +110,8 @@ def _check_image_state(session: ChatGPTSession) -> dict:
 
 
 # Cantidad de checks consecutivos con la misma URL para considerar estable
-_STABLE_CHECKS_REQUIRED = 4
-_STABLE_CHECK_INTERVAL = 2  # segundos entre cada check de estabilidad
+_STABLE_CHECKS_REQUIRED = 2
+_STABLE_CHECK_INTERVAL = 1  # segundos entre cada check de estabilidad
 
 
 def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
@@ -322,9 +322,9 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
     filename = _build_filename(image_url)
     output_path = out_dir / filename
 
-    # Esperar antes del primer intento para dar tiempo a la renderización final
-    log_info("Esperando 10s para que ChatGPT finalice el renderizado...")
-    time.sleep(10)
+    # Esperar breve antes del primer intento
+    log_info("Esperando 3s para renderizado final...")
+    time.sleep(3)
 
     cookies = _get_cookies_via_cdp(session)
 

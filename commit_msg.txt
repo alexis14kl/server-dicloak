@@ -1,1 +1,1 @@
-fix: reconocer boton cerrar/close como perfil ya abierto
+perf: reducir esperas de descarga de imagen de 20s a 5s
