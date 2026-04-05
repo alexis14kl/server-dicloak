@@ -322,9 +322,8 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
     filename = _build_filename(image_url)
     output_path = out_dir / filename
 
-    # Esperar breve antes del primer intento
-    log_info("Esperando 3s para renderizado final...")
-    time.sleep(3)
+    # Esperar minimo antes del primer intento de descarga
+    time.sleep(1)
 
     cookies = _get_cookies_via_cdp(session)
 
