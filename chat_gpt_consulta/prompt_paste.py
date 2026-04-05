@@ -55,14 +55,19 @@ class ChatGPTSession:
             return False
 
     def _find_chatgpt_target(self) -> str:
-        """Busca la página de ChatGPT entre los targets CDP."""
+        """Busca la página de ChatGPT entre los targets CDP.
+        Retorna la ULTIMA tab de ChatGPT (la mas reciente), no la primera.
+        """
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=3) as resp:
                 targets = json.loads(resp.read().decode("utf-8"))
+            last_ws = ""
             for t in targets:
                 url = (t.get("url") or "").lower()
                 if "chatgpt.com" in url and t.get("type") == "page":
-                    return t.get("webSocketDebuggerUrl", "")
+                    last_ws = t.get("webSocketDebuggerUrl", "")
+            if last_ws:
+                return last_ws
             log_warn(f"No hay página chatgpt.com entre {len(targets)} targets en puerto {self.port}")
         except Exception as e:
             log_warn(f"No se pudo conectar a CDP en puerto {self.port}: {e}")

@@ -1,1 +1,1 @@
-fix: open_profile maneja estados Ver/Abriendo sin fallar + cdp_bridge robusto
+fix: conectar a la ultima tab de ChatGPT (no la primera) para detectar imagen generada
