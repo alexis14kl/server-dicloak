@@ -214,23 +214,15 @@ def ensure_chatgpt_reachable(port: int) -> int:
             log_ok(f"Proxy vivo — conexion OK")
             return port
         else:
-            log_warn(f"Proxy MUERTO: {proxy}")
+            log_warn(f"Proxy MUERTO: {proxy} — creando tab sin proxy...")
     else:
         log_info("Perfil sin proxy — conexion directa")
         return port
 
-    # 2. Verificar si la pagina ya tiene error
-    page_status = _check_page_error(port)
-    if page_status == "OK":
-        log_ok("ChatGPT cargado correctamente (a pesar del proxy test)")
-        return port
-
-    log_warn(f"ChatGPT inaccesible ({page_status}) — creando tab sin proxy...")
-
-    # 3. Crear tab sin proxy
-    target_id = create_direct_chatgpt_tab(port, timeout=12)
+    # 2. Proxy muerto: crear tab nueva sin proxy (no confiar en tab existente)
+    target_id = create_direct_chatgpt_tab(port, timeout=15)
     if target_id:
-        log_ok(f"Tab sin proxy lista. ChatGPT accesible via conexion directa.")
+        log_ok(f"Tab sin proxy lista — ChatGPT accesible via conexion directa.")
         return port
 
     log_error("No se pudo crear tab sin proxy")
