@@ -92,7 +92,7 @@ def _check_image_state(session: ChatGPTSession) -> dict:
                 const h = img.naturalHeight || 0;
                 const complete = img.complete === true;
                 return JSON.stringify({
-                    status: (w >= 512 && complete) ? 'READY' : 'LOADING',
+                    status: (w >= 1024 && complete) ? 'READY' : 'LOADING',
                     url, width: w, height: h, complete
                 });
             }
@@ -109,9 +109,11 @@ def _check_image_state(session: ChatGPTSession) -> dict:
         return {"status": "WAITING"}
 
 
-# Cantidad de checks consecutivos con la misma URL para considerar estable
-_STABLE_CHECKS_REQUIRED = 3
-_STABLE_CHECK_INTERVAL = 2  # segundos entre cada check de estabilidad
+# Cantidad de checks consecutivos con la misma URL para considerar estable.
+# DALL-E sirve primero una versión intermedia y luego la final en la misma URL.
+# Necesitamos suficientes checks para que la versión final se estabilice.
+_STABLE_CHECKS_REQUIRED = 5
+_STABLE_CHECK_INTERVAL = 3  # segundos entre cada check de estabilidad
 
 
 def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
@@ -300,9 +302,9 @@ def _download_with_cdp(session: ChatGPTSession, image_url: str, output_path: Pat
 
 
 # Tamaño mínimo para considerar una imagen como final (no preview borroso).
-# ChatGPT genera imágenes de 200KB-3MB dependiendo del contenido.
-# Previews borrosos pesan < 100KB. Imágenes reales >= 200KB.
-_MIN_FINAL_IMAGE_SIZE = 200_000  # 200KB
+# DALL-E genera imágenes finales de 1-4MB. Versiones intermedias pesan 200KB-800KB.
+# Solo aceptar imágenes >= 500KB como versión final.
+_MIN_FINAL_IMAGE_SIZE = 500_000  # 500KB
 
 
 def download_image(session: ChatGPTSession, image_url: str, output_dir: str = "") -> str:
@@ -322,9 +324,10 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
     filename = _build_filename(image_url)
     output_path = out_dir / filename
 
-    # Esperar a que ChatGPT termine de renderizar la textura final
-    log_info("Esperando 5s para renderizado final...")
-    time.sleep(5)
+    # Esperar a que DALL-E termine de servir la versión final en la URL.
+    # La URL es la misma pero el contenido cambia: primero preview, luego HQ.
+    log_info("Esperando 12s para renderizado final de DALL-E...")
+    time.sleep(12)
 
     cookies = _get_cookies_via_cdp(session)
 
