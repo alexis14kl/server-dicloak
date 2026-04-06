@@ -310,21 +310,38 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
         'PROFILE_NOT_FOUND' — no se encontro el perfil
         'NO_OPEN_BUTTON: ...' — no hay boton reconocido
     """
+    # Reinyectar hook SIEMPRE antes de abrir — puede perderse por navegación interna
+    inject_cdp_hook(port)
+
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
     open_js = f"""(() => {{
         try {{
             const targetName = "{safe_name}".toLowerCase().trim();
-            const rows = document.querySelectorAll('.el-table__row');
+            const rows = Array.from(document.querySelectorAll('.el-table__row'));
             let targetRow = null;
 
+            // Paso 1: match exacto
             for (const row of rows) {{
                 const cells = Array.from(row.querySelectorAll('td .cell'));
-                const nameCell = (cells[2]?.innerText || '').trim();
-                if (nameCell.toLowerCase() === targetName || nameCell.toLowerCase().includes(targetName) || targetName.includes(nameCell.toLowerCase())) {{
-                    targetRow = row;
-                    break;
+                const nameCell = (cells[2]?.innerText || '').trim().toLowerCase();
+                if (nameCell === targetName) {{ targetRow = row; break; }}
+            }}
+
+            // Paso 2: match parcial — preferir filas que tengan boton "Abrir"
+            if (!targetRow) {{
+                let fallback = null;
+                for (const row of rows) {{
+                    const cells = Array.from(row.querySelectorAll('td .cell'));
+                    const nameCell = (cells[2]?.innerText || '').trim().toLowerCase();
+                    if (nameCell.includes(targetName) || targetName.includes(nameCell)) {{
+                        const btns = Array.from(row.querySelectorAll('button'));
+                        const hasOpen = btns.some(b => /^(abrir|open|launch)$/i.test((b.innerText||'').trim()));
+                        if (hasOpen) {{ targetRow = row; break; }}
+                        if (!fallback) fallback = row;
+                    }}
                 }}
+                if (!targetRow) targetRow = fallback;
             }}
 
             if (!targetRow) return 'PROFILE_NOT_FOUND';

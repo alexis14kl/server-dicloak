@@ -257,10 +257,16 @@ class DICloakService:
                 "cdp_active": False, "clicked": True}
 
     def _wait_for_cdp_port(self, timeout: int) -> int:
-        """Espera a que aparezca un puerto CDP activo. Retorna puerto o 0."""
-        deadline = time.time() + min(timeout, 30)
+        """Espera a que aparezca un puerto CDP activo. Retorna puerto o 0.
+
+        Polling agresivo: empieza cada 0.3s los primeros 10s,
+        luego cada 1s hasta agotar el timeout completo.
+        """
+        deadline = time.time() + timeout
+        attempt = 0
         while time.time() < deadline:
-            # Via cdp_debug_info.json
+            attempt += 1
+            # Via cdp_debug_info.json (rápido, archivo local)
             data = read_cdp_debug_info()
             for entry in data.values():
                 if not isinstance(entry, dict):
@@ -270,14 +276,19 @@ class DICloakService:
                 except (TypeError, ValueError):
                     continue
                 if port and _test_cdp_port(port):
+                    log_ok(f"CDP detectado via cdp_debug_info — puerto {port} (intento {attempt})")
                     return port
-            # Via proceso (fallback)
+            # Via proceso (fallback — busca ginsbrowser con --remote-debugging-port)
             running = self.get_running_profiles()
             for p in running:
                 rport = p.get("debug_port", 0)
                 if rport and p.get("cdp_active"):
+                    log_ok(f"CDP detectado via proceso — puerto {rport} (intento {attempt})")
                     return rport
-            time.sleep(0.5)
+            # Polling agresivo los primeros 10s, luego más relajado
+            elapsed = timeout - (deadline - time.time())
+            time.sleep(0.3 if elapsed < 10 else 1)
+        log_warn(f"CDP no detectado tras {timeout}s de polling ({attempt} intentos)")
         return 0
 
     def close_profiles(self) -> int:
@@ -500,7 +511,7 @@ def chatgpt_prompt(req: PromptRequest):
     try:
         # Verificar proxy y crear tab sin proxy si es necesario
         from chat_gpt_consulta.proxy_bypass import ensure_chatgpt_reachable
-        port = ensure_chatgpt_reachable(req.port)
+        port, tab_ws = ensure_chatgpt_reachable(req.port)
         if not port:
             return error_response("Proxy muerto y no se pudo crear bypass", 503)
 
@@ -511,6 +522,7 @@ def chatgpt_prompt(req: PromptRequest):
                 prompt=req.prompt,
                 wait_response=req.wait_response,
                 timeout=req.timeout,
+                target_ws=tab_ws,
             )
         else:
             from chat_gpt_consulta.prompt_paste import paste_and_send_prompt
@@ -519,6 +531,7 @@ def chatgpt_prompt(req: PromptRequest):
                 prompt=req.prompt,
                 wait_response=req.wait_response,
                 timeout=req.timeout,
+                target_ws=tab_ws,
             )
         if result.get("success"):
             return success_response(data=result, message="Prompt enviado a ChatGPT")

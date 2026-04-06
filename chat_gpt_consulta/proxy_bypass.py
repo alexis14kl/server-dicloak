@@ -121,6 +121,21 @@ def _get_browser_ws(port: int) -> str:
         return ""
 
 
+def _get_ws_url_for_target(port: int, target_id: str, retries: int = 5) -> str:
+    """Busca el webSocketDebuggerUrl de un targetId en /json."""
+    for _ in range(retries):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
+                targets = json.loads(r.read().decode())
+            for t in targets:
+                if t.get("id") == target_id:
+                    return t.get("webSocketDebuggerUrl", "")
+        except Exception:
+            pass
+        time.sleep(1)
+    return ""
+
+
 def create_direct_chatgpt_tab(port: int, timeout: int = 15) -> Optional[str]:
     """
     Crea una nueva tab con BrowserContext sin proxy y navega a ChatGPT.
@@ -189,13 +204,15 @@ def create_direct_chatgpt_tab(port: int, timeout: int = 15) -> Optional[str]:
             pass
 
 
-def ensure_chatgpt_reachable(port: int) -> int:
+def ensure_chatgpt_reachable(port: int) -> tuple[int, str]:
     """
     Verifica que ChatGPT sea accesible en este puerto CDP.
     Si el proxy del perfil esta muerto, crea una tab sin proxy.
 
-    Retorna el mismo puerto (la nueva tab esta en el mismo browser).
-    Si falla, retorna 0.
+    Retorna (port, ws_url):
+      - port: el mismo puerto CDP (nueva tab esta en el mismo browser)
+      - ws_url: WebSocket URL de la tab correcta ("" si proxy OK y no se creó tab)
+    Si falla, retorna (0, "").
     """
     # 1. Verificar si hay proxy y si funciona
     proxy = _get_proxy_from_cmdline(port)
@@ -203,18 +220,22 @@ def ensure_chatgpt_reachable(port: int) -> int:
         log_info(f"Proxy del perfil: {proxy}")
         if _test_proxy(proxy, timeout=8):
             log_ok(f"Proxy vivo — conexion OK")
-            return port
+            return port, ""
         else:
             log_warn(f"Proxy MUERTO: {proxy} — creando tab sin proxy...")
     else:
         log_info("Perfil sin proxy — conexion directa")
-        return port
+        return port, ""
 
     # 2. Proxy muerto: crear tab nueva sin proxy (no confiar en tab existente)
     target_id = create_direct_chatgpt_tab(port, timeout=15)
     if target_id:
-        log_ok(f"Tab sin proxy lista — ChatGPT accesible via conexion directa.")
-        return port
+        ws_url = _get_ws_url_for_target(port, target_id)
+        if ws_url:
+            log_ok(f"Tab sin proxy lista — ws: ...{ws_url[-40:]}")
+        else:
+            log_warn("Tab creada pero no se encontró su WebSocket URL")
+        return port, ws_url
 
     log_error("No se pudo crear tab sin proxy")
-    return 0
+    return 0, ""

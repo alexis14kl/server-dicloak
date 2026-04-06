@@ -617,7 +617,8 @@ class ChatGPTSession:
 
 # ── Función principal ────────────────────────────────────────────────────────
 
-def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True, timeout: int = 120) -> dict:
+def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True,
+                          timeout: int = 120, target_ws: str = "") -> dict:
     """
     Pega y envía un prompt en ChatGPT via CDP.
 
@@ -626,13 +627,24 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True, ti
         prompt: Texto del prompt a enviar
         wait_response: Si True, espera la respuesta completa
         timeout: Timeout en segundos para la respuesta
+        target_ws: WebSocket URL exacta de la tab a usar (evita buscar)
 
     Returns:
         dict con status, response (si wait_response=True), y detalles
     """
     session = ChatGPTSession(port=port)
 
-    if not session.connect():
+    if target_ws:
+        session.ws_url = target_ws
+        try:
+            import websockets.sync.client as ws_sync
+            session._ws = ws_sync.connect(target_ws, max_size=2**22)
+            log_ok(f"Conectado directo a tab: ...{target_ws[-40:]}")
+        except Exception as e:
+            log_warn(f"No se pudo conectar a target_ws: {e}")
+            if not session.connect():
+                return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+    elif not session.connect():
         return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
 
     try:
@@ -676,6 +688,7 @@ MAX_ROTATION_ATTEMPTS = 20
 
 def paste_and_send_with_rotation(
     port: int, prompt: str, wait_response: bool = True, timeout: int = 120,
+    target_ws: str = "",
 ) -> dict:
     """
     Pega y envía prompt con rotación automática de cuentas.
@@ -686,7 +699,18 @@ def paste_and_send_with_rotation(
     Si 'sesión expirada', retorna error para que el caller cambie perfil DiCloak.
     """
     session = ChatGPTSession(port=port)
-    if not session.connect():
+
+    if target_ws:
+        session.ws_url = target_ws
+        try:
+            import websockets.sync.client as ws_sync
+            session._ws = ws_sync.connect(target_ws, max_size=2**22)
+            log_ok(f"Conectado directo a tab: ...{target_ws[-40:]}")
+        except Exception as e:
+            log_warn(f"No se pudo conectar a target_ws: {e}")
+            if not session.connect():
+                return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+    elif not session.connect():
         return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
 
     last_account_id = ""
