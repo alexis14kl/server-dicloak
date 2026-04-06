@@ -345,11 +345,11 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
             const rows = Array.from(document.querySelectorAll('.el-table__row'));
             let targetRow = null;
 
-            // Paso 1: match exacto
+            // Paso 1: match exacto (buscar en TODAS las celdas, no solo una posición fija)
             for (const row of rows) {{
                 const cells = Array.from(row.querySelectorAll('td .cell'));
-                const nameCell = (cells[2]?.innerText || '').trim().toLowerCase();
-                if (nameCell === targetName) {{ targetRow = row; break; }}
+                const match = cells.some(c => (c.innerText || '').trim().toLowerCase() === targetName);
+                if (match) {{ targetRow = row; break; }}
             }}
 
             // Paso 2: match parcial — preferir filas que tengan boton "Abrir"
@@ -357,8 +357,9 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
                 let fallback = null;
                 for (const row of rows) {{
                     const cells = Array.from(row.querySelectorAll('td .cell'));
-                    const nameCell = (cells[2]?.innerText || '').trim().toLowerCase();
-                    if (nameCell.includes(targetName) || targetName.includes(nameCell)) {{
+                    const texts = cells.map(c => (c.innerText || '').trim().toLowerCase());
+                    const match = texts.some(t => t.includes(targetName) || targetName.includes(t));
+                    if (match) {{
                         const btns = Array.from(row.querySelectorAll('button'));
                         const hasOpen = btns.some(b => /^(abrir|open|launch)$/i.test((b.innerText||'').trim()));
                         if (hasOpen) {{ targetRow = row; break; }}
