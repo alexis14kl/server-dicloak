@@ -365,49 +365,19 @@ class ChatGPTSession:
 
         Retorna: 'success', 'no_image_tokens', 'session_expired'
 
-        Flujo:
-          1. Esperar a que ChatGPT empiece a responder (nuevo turno del asistente)
-          2. Esperar a que termine de responder (stop button desaparece)
-          3. Verificar si la respuesta es un error de tokens
+        Flujo simplificado:
+          1. Esperar que ChatGPT termine de generar (stop button desaparece)
+          2. Verificar si la respuesta es un error de tokens
+        No depende de contar turns (frágil con timeouts CDP).
         """
         deadline = time.time() + timeout_sec
 
-        # ── Fase 1: Esperar que ChatGPT empiece a responder ──────────────
-        # Contar turnos actuales para detectar un nuevo turno del asistente
-        initial_turns = self.evaluate("""(() => {
-            return document.querySelectorAll(
-                '[data-testid^="conversation-turn"],[data-message-id],article'
-            ).length;
-        })()""")
-        initial_count = int(initial_turns or "0")
+        # Esperar un momento para que ChatGPT empiece a procesar
+        time.sleep(2)
 
-        response_started = False
-        while time.time() < deadline:
-            current = self.evaluate("""(() => {
-                return document.querySelectorAll(
-                    '[data-testid^="conversation-turn"],[data-message-id],article'
-                ).length;
-            })()""")
-            if int(current or "0") > initial_count:
-                response_started = True
-                break
-
-            # Mientras esperamos, chequear tokens por si el mensaje ya apareció
-            if self._check_no_tokens():
-                return "no_image_tokens"
-
-            time.sleep(1)
-
-        if not response_started:
-            # Timeout esperando respuesta — verificar tokens una vez más
-            if self._check_no_tokens():
-                return "no_image_tokens"
-            return "success"
-
-        # ── Fase 2: Esperar que ChatGPT termine de responder ─────────────
+        # ── Fase única: Monitorear estado de generación ──────────────────
         idle_cycles = 0
         while time.time() < deadline:
-            # Chequear tokens en cada ciclo (puede aparecer en cualquier momento)
             if self._check_no_tokens():
                 return "no_image_tokens"
 
@@ -416,10 +386,12 @@ class ChatGPTSession:
 
             generating = self.evaluate("""(() => {
                 const stop = document.querySelector('button[data-testid="stop-button"]')
-                    || document.querySelector('button[aria-label="Stop generating"]');
+                    || document.querySelector('button[aria-label="Stop generating"]')
+                    || document.querySelector('button[aria-label="Detener la generación"]');
                 const progress = document.querySelector('[role="progressbar"]');
                 const body = (document.body?.innerText || '').toLowerCase();
-                const creating = body.includes('creando imagen') || body.includes('creating image');
+                const creating = body.includes('creando imagen') || body.includes('creating image')
+                    || body.includes('generando') || body.includes('generating');
                 return (stop || progress || creating) ? 'YES' : 'NO';
             })()""")
 
@@ -427,15 +399,13 @@ class ChatGPTSession:
                 idle_cycles = 0
             else:
                 idle_cycles += 1
-                # Esperar suficientes ciclos para que el mensaje completo se renderice
-                if idle_cycles >= 8:
+                if idle_cycles >= 4:
                     break
 
             time.sleep(1)
 
-        # ── Fase 3: Verificación final después de que ChatGPT terminó ────
-        # Dar tiempo extra para que el DOM se actualice completamente
-        time.sleep(2)
+        # ── Verificación final ───────────────────────────────────────────
+        time.sleep(1)
         if self._check_no_tokens():
             return "no_image_tokens"
         if self._check_session_expired():
