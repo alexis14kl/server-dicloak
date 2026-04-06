@@ -40,7 +40,7 @@ class DICloakAPI:
     port: int = 0
     api_key: str = ""
     host: str = "127.0.0.1"
-    timeout: int = 15
+    timeout: int = 2
 
     def __post_init__(self):
         if not self.port:

@@ -31,7 +31,9 @@ class ChatGPTSession:
     _msg_id: int = field(default=0, repr=False)
 
     def connect(self) -> bool:
-        """Conecta al CDP del navegador de ChatGPT."""
+        """Conecta al CDP del navegador de ChatGPT.
+        Si ws_url ya está seteado (target_ws), reconecta a esa misma tab.
+        """
         try:
             import websockets.sync.client as ws_sync
         except ImportError:
@@ -39,8 +41,9 @@ class ChatGPTSession:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
             import websockets.sync.client as ws_sync
 
-        # Buscar la página de ChatGPT entre los targets
-        self.ws_url = self._find_chatgpt_target()
+        # Si ya tenemos ws_url (target_ws), reconectar a la misma tab
+        if not self.ws_url:
+            self.ws_url = self._find_chatgpt_target()
         if not self.ws_url:
             log_warn(f"No se encontró página de ChatGPT en puerto {self.port}")
             return False

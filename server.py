@@ -122,19 +122,25 @@ class DICloakService:
             "targets_count": len(targets),
         }
 
-    def get_profiles(self) -> list[dict]:
-        # Intentar primero via REST API (puerto 52140) — más fiable que scraping DOM
-        try:
-            if DICloakAPI is None:
-                raise ImportError("api.py no disponible")
-            api = DICloakAPI()
-            profiles = api.list_profiles()
-            if profiles:
-                return [{"id": p.id, "name": p.name, "status": p.status} for p in profiles]
-        except Exception:
-            pass
+    _openapi_available: bool | None = None  # cache: None=no probado, True/False=resultado
 
-        # Fallback: scraping del DOM via CDP
+    def get_profiles(self) -> list[dict]:
+        # Intentar REST API solo si no ha fallado antes (evita ~10s de timeouts)
+        if self._openapi_available is not False:
+            try:
+                if DICloakAPI is None:
+                    raise ImportError("api.py no disponible")
+                api = DICloakAPI()
+                if self._openapi_available is None:
+                    self._openapi_available = api.is_available()
+                if self._openapi_available:
+                    profiles = api.list_profiles()
+                    if profiles:
+                        return [{"id": p.id, "name": p.name, "status": p.status} for p in profiles]
+            except Exception:
+                self._openapi_available = False
+
+        # CDP directo — lee la tabla del DOM en ~6ms
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde en puerto CDP.")
         profiles = list_profiles_via_cdp(self.port)
@@ -674,6 +680,18 @@ def main():
         print("[OK] CDP conectado y hook inyectado — listo para abrir perfiles")
     else:
         print("[WARN] No se pudo conectar CDP al iniciar — se reintentará en cada request")
+
+    # Pre-cachear estado de Open API (evita ~2s en primera request)
+    try:
+        if DICloakAPI is not None:
+            api = DICloakAPI()
+            service._openapi_available = api.is_available()
+            if service._openapi_available:
+                print("[OK] Open API disponible en puerto", api.port)
+            else:
+                print("[INFO] Open API no disponible — usando CDP directo")
+    except Exception:
+        service._openapi_available = False
 
     # Mostrar perfiles con CDP activo
     debug_data = read_cdp_debug_info()
