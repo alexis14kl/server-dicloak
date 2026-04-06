@@ -310,11 +310,35 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
         'PROFILE_NOT_FOUND' — no se encontro el perfil
         'NO_OPEN_BUTTON: ...' — no hay boton reconocido
     """
-    # Reinyectar hook SIEMPRE antes de abrir — puede perderse por navegación interna
     inject_cdp_hook(port)
-
+    _ensure_on_profile_list(port)
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
+    # Paso 1: Scroll a la fila del perfil para que se renderice el boton
+    scroll_js = f"""(() => {{
+        const targetName = "{safe_name}".toLowerCase().trim();
+        const rows = document.querySelectorAll('.el-table__row');
+        for (const row of rows) {{
+            const cells = Array.from(row.querySelectorAll('td .cell'));
+            const nameCell = (cells[2]?.innerText || '').trim();
+            if (nameCell.toLowerCase() === targetName || nameCell.toLowerCase().includes(targetName) || targetName.includes(nameCell.toLowerCase())) {{
+                row.scrollIntoView({{block: 'center'}});
+                return 'SCROLLED: ' + nameCell;
+            }}
+        }}
+        return 'NOT_FOUND';
+    }})()"""
+    scroll_result = cdp_evaluate_sync(scroll_js, port, timeout=5)
+    log_info(f"Scroll perfil: {scroll_result}")
+
+    if scroll_result and "NOT_FOUND" in str(scroll_result):
+        log_warn(f"Perfil '{profile_name}' no encontrado en la tabla")
+        return False
+
+    import time as _time2
+    _time2.sleep(1)
+
+    # Paso 2: Buscar boton y hacer click
     open_js = f"""(() => {{
         try {{
             const targetName = "{safe_name}".toLowerCase().trim();
@@ -366,6 +390,7 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
     }})()"""
 
     result = str(cdp_evaluate_sync(open_js, port, timeout=5) or "")
+    log_info(f"open_profile result: {result}")
 
     if "CLICKED_OPEN" in result:
         log_ok(f"Perfil '{profile_name}' abierto via CDP")

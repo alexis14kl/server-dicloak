@@ -474,33 +474,21 @@ def _get_cookies_from_cdp(session: Veo3Session) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in cookies_list)
 
 
-def _download_full_video(session: Veo3Session, output_dir: str = "") -> str:
-    """Descarga video via menu UI de la vista individual.
+def _download_video_from_page(session: Veo3Session, output_dir: str = "") -> str:
+    """Descarga el video de la vista individual.
 
     Flujo:
-    1. Click en tile para abrir vista individual (/edit/)
-    2. En vista individual: click en boton "Descargar"/"Download" de la barra superior
-    3. Click en opcion de descarga (Full Video → 720p, o descarga directa)
-    4. Esperar archivo en directorio
+    1. Si no estamos en vista individual, click en tile
+    2. Extraer URL del video del elemento <video> en el DOM
+    3. Descargar via urllib con cookies httpOnly del browser
     """
+    import re
+    import urllib.request as _urllib_request
+
     out_dir = Path(output_dir) if output_dir else DEFAULT_VIDEO_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Configurar CDP para descargas
-    log_info(f"[DESCARGA] Configurando directorio: {out_dir}")
-    session._send_raw("Browser.setDownloadBehavior", {
-        "behavior": "allow",
-        "downloadPath": str(out_dir),
-    })
-    session._send_raw("Page.setDownloadBehavior", {
-        "behavior": "allow",
-        "downloadPath": str(out_dir),
-    })
-
-    existing_files = set(f.name for f in out_dir.glob("*.*"))
-    log_info(f"[DESCARGA] Archivos existentes: {len(existing_files)}")
-
-    # Paso 1: Verificar si estamos en vista individual, si no, ir ahi
+    # Paso 1: Ir a vista individual si no estamos ahi
     current_url = session.evaluate("window.location.href") or ""
     if "/edit/" not in current_url.lower():
         log_info("[DESCARGA] No estamos en vista individual. Seleccionando tile...")
@@ -514,171 +502,95 @@ def _download_full_video(session: Veo3Session, output_dir: str = "") -> str:
     else:
         log_info("[DESCARGA] Ya en vista individual")
 
-    time.sleep(1)
-
-    # Paso 2: Click en boton "Descargar"/"Download" de la BARRA SUPERIOR
-    # En la vista individual los botones estan arriba: "Descargar", "Ocultar historial", "Hecho"
-    log_info("[DESCARGA] Paso 2: Click en Descargar (barra superior)...")
-    clicked_download = session.evaluate("""(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
-        // Buscar boton que diga EXACTAMENTE "Descargar" o "Download"
-        // (con posible icono "download" antes)
-        for (const btn of btns) {
-            if (!btn.offsetParent) continue;
-            const rect = btn.getBoundingClientRect();
-            // Debe estar en la parte SUPERIOR (barra de acciones)
-            if (rect.top > 200) continue;
-            const text = (btn.innerText || '').trim().toLowerCase();
-            if (text.includes('descargar') || text.includes('download')) {
-                btn.click();
-                return 'CLICKED: ' + (btn.innerText || '').trim().substring(0, 30);
-            }
-        }
-        return 'NOT_FOUND';
-    })()""")
-
-    if not clicked_download or "CLICKED" not in str(clicked_download):
-        log_error("[DESCARGA] No se encontro boton Descargar en barra superior")
-        return ""
-    log_ok(f"[DESCARGA] {clicked_download}")
     time.sleep(2)
 
-    # Debug: que aparecio despues del click
-    menu_debug = session.evaluate("""(() => {
-        // Buscar elementos de menu/popup que aparecieron
-        const items = Array.from(document.querySelectorAll(
-            '[role="menu"] *, [role="listbox"] *, [role="dialog"] *, [class*="menu"] *, [class*="popup"] *, [class*="dropdown"] *'
-        )).filter(el => {
-            if (!el.offsetParent) return false;
-            const t = (el.innerText || '').trim();
-            return t.length > 0 && t.length < 50;
+    # Paso 2: Extraer URL del video principal del DOM
+    log_info("[DESCARGA] Paso 2: Extrayendo URL del video...")
+    video_info = session.evaluate("""(() => {
+        const isPlaceholder = (url) => {
+            const v = String(url || '').toLowerCase();
+            return v.includes('gstatic.com') || v.includes('aitestkitchen')
+                || v.endsWith('/back.mp4') || v.includes('banner');
+        };
+        const videos = Array.from(document.querySelectorAll('video'));
+        const real = videos.filter(v => {
+            const src = (v.src || v.currentSrc || '').trim();
+            if (!src || isPlaceholder(src)) return false;
+            const w = v.videoWidth || 0;
+            const h = v.videoHeight || 0;
+            return w >= 320 && h >= 180;
         });
-        // Si no hay menu, listar botones visibles
-        if (items.length === 0) {
-            return JSON.stringify(Array.from(document.querySelectorAll('button')).filter(b => {
-                if (!b.offsetParent) return false;
-                const text = (b.innerText || '').trim();
-                return text.length > 0 && text.length < 50;
-            }).map(b => (b.innerText || '').trim()).slice(0, 15));
-        }
-        return JSON.stringify(items.map(el => ({
-            tag: el.tagName,
-            text: (el.innerText || '').trim().substring(0, 40),
-        })).slice(0, 15));
-    })()""")
-    log_info(f"[DESCARGA] Menu/opciones despues de Descargar: {menu_debug}")
-
-    # Paso 3: Buscar opciones de descarga
-    # Posibles: "Full Video"/"Video completo", "720p", "Clip", etc.
-    log_info("[DESCARGA] Paso 3: Buscando opcion de descarga...")
-    clicked_option = session.evaluate("""(() => {
-        const normalize = (s) => String(s || '').toLowerCase().trim();
-
-        // Buscar en items de menu/popup/dropdown
-        const selectors = [
-            '[role="menu"] button', '[role="menu"] [role="menuitem"]',
-            '[role="listbox"] [role="option"]', '[role="dialog"] button',
-            '[class*="menu"] button', '[class*="popup"] button',
-            '[class*="dropdown"] button', '[class*="dropdown"] a',
-        ].join(', ');
-
-        let items = Array.from(document.querySelectorAll(selectors)).filter(el => el.offsetParent !== null);
-
-        // Si no hay items de menu, buscar botones generales que aparecieron
-        if (items.length === 0) {
-            items = Array.from(document.querySelectorAll('button, a, [role="button"], [role="menuitem"]'))
-                .filter(el => el.offsetParent !== null);
-        }
-
-        // Prioridad 1: "Full Video" / "Video completo" (exacto, no substring parcial)
-        for (const item of items) {
-            const text = normalize(item.innerText || item.textContent || '');
-            // Solo matchear si es la opcion directa, no "ver panel completo"
-            if ((text === 'full video' || text === 'video completo'
-                || text.startsWith('full video') || text.startsWith('video completo'))
-                && !text.includes('panel') && !text.includes('control')) {
-                item.click();
-                return 'CLICKED_FULL: ' + text.substring(0, 40);
-            }
-        }
-
-        // Prioridad 2: Calidad directa (720p, 1080p)
-        for (const item of items) {
-            const text = normalize(item.innerText || item.textContent || '');
-            if (text.includes('720') || text.includes('1080')) {
-                item.click();
-                return 'CLICKED_QUALITY: ' + text.substring(0, 40);
-            }
-        }
-
-        // Prioridad 3: Cualquier opcion con "mp4" o "video" que no sea navegacion
-        for (const item of items) {
-            const text = normalize(item.innerText || item.textContent || '');
-            if ((text.includes('mp4') || text.includes('.mp4'))
-                && !text.includes('volver') && !text.includes('back')) {
-                item.click();
-                return 'CLICKED_FORMAT: ' + text.substring(0, 40);
-            }
-        }
-
-        return 'NOT_FOUND';
+        if (!real.length) return JSON.stringify({found: false});
+        // Tomar el video mas grande (principal)
+        real.sort((a, b) => (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight));
+        const v = real[0];
+        return JSON.stringify({
+            found: true,
+            src: v.src || v.currentSrc || '',
+            width: v.videoWidth || 0,
+            height: v.videoHeight || 0,
+            duration: isNaN(v.duration) ? 0 : v.duration,
+        });
     })()""")
 
-    if clicked_option and "CLICKED" in str(clicked_option):
-        log_ok(f"[DESCARGA] {clicked_option}")
-        time.sleep(2)
+    if not video_info:
+        log_error("[DESCARGA] No se pudo evaluar JS para extraer video")
+        return ""
 
-        # Si fue Full Video, buscar submenu de calidad
-        if "CLICKED_FULL" in str(clicked_option):
-            log_info("[DESCARGA] Buscando calidad en submenu...")
-            session.evaluate("""(() => {
-                const items = Array.from(document.querySelectorAll(
-                    'button, [role="menuitem"], [role="option"], a, span'
-                )).filter(el => el.offsetParent !== null);
-                for (const item of items) {
-                    const text = (item.innerText || '').toLowerCase().trim();
-                    if (text.includes('720') || text.includes('1080') || text.includes('mp4')) {
-                        item.click();
-                        return;
-                    }
-                }
-            })()""")
-            time.sleep(1)
-    else:
-        log_info(f"[DESCARGA] No se encontro menu de opciones ({clicked_option}). La descarga pudo haber iniciado directamente.")
+    try:
+        info = json.loads(video_info)
+    except Exception:
+        log_error(f"[DESCARGA] Respuesta inesperada: {video_info}")
+        return ""
 
-    # Paso 4: Esperar archivo descargado
-    log_info("[DESCARGA] Paso 4: Esperando archivo descargado...")
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        remaining = int(deadline - time.time())
+    if not info.get("found"):
+        log_error("[DESCARGA] No se encontro video real en la vista individual")
+        return ""
 
-        # Buscar cualquier archivo nuevo (mp4, webm, etc.)
-        current_files = set(f.name for f in out_dir.iterdir() if f.is_file())
-        new_files = current_files - existing_files
-        # Filtrar archivos temporales
-        new_files = {f for f in new_files if not f.endswith('.crdownload') and not f.startswith('.')}
+    video_url = info["src"]
+    width = info.get("width", 0)
+    height = info.get("height", 0)
+    duration = info.get("duration", 0)
+    log_ok(f"[DESCARGA] Video encontrado: {width}x{height} | {duration:.1f}s")
+    log_info(f"[DESCARGA] URL: {video_url[:80]}...")
 
-        if new_files:
-            for fname in new_files:
-                fpath = out_dir / fname
-                size = fpath.stat().st_size
-                if size > 100_000:
-                    time.sleep(3)
-                    final_size = fpath.stat().st_size
-                    if final_size == size:
-                        size_mb = final_size / (1024 * 1024)
-                        log_ok(f"[DESCARGA] Video descargado: {fname} ({size_mb:.1f}MB)")
-                        return str(fpath)
-                    log_info(f"[DESCARGA] Archivo creciendo... {size} → {final_size} bytes")
+    # Paso 3: Descargar con cookies httpOnly
+    log_info("[DESCARGA] Paso 3: Descargando video con cookies...")
+    cookies = _get_cookies_from_cdp(session)
+    log_info(f"[DESCARGA] Cookies obtenidas: {len(cookies)} chars")
 
-        downloading = list(out_dir.glob("*.crdownload"))
-        if downloading and remaining % 10 < 3:
-            log_info(f"[DESCARGA] Descarga en progreso... ({len(downloading)} archivo(s)) | quedan {remaining}s")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    match = re.search(r"name=([a-f0-9-]+)", video_url)
+    video_id = match.group(1)[:12] if match else f"veo_{int(time.time())}"
+    output_path = out_dir / f"{ts}_{video_id}.mp4"
 
-        time.sleep(2)
+    for attempt in range(1, 4):
+        log_info(f"[DESCARGA] Intento {attempt}/3...")
+        try:
+            req = _urllib_request.Request(video_url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+                "Cookie": cookies,
+                "Referer": "https://labs.google/",
+            })
+            with _urllib_request.urlopen(req, timeout=180) as resp:
+                video_bytes = resp.read()
 
-    log_error("[DESCARGA] Timeout (120s) esperando archivo descargado")
+            if len(video_bytes) < 100_000:
+                log_warn(f"[DESCARGA] Intento {attempt}/3: archivo muy pequeno ({len(video_bytes)} bytes)")
+                time.sleep(3)
+                continue
+
+            output_path.write_bytes(video_bytes)
+            size_mb = len(video_bytes) / (1024 * 1024)
+            log_ok(f"[DESCARGA] Video descargado: {output_path.name} ({size_mb:.1f}MB)")
+            return str(output_path)
+
+        except Exception as e:
+            log_warn(f"[DESCARGA] Intento {attempt}/3 fallo: {e}")
+            time.sleep(3)
+
+    log_error("[DESCARGA] No se pudo descargar el video despues de 3 intentos")
     return ""
 
 
@@ -769,7 +681,7 @@ def download_extended_video(port: int, timeout: int = 600, output_dir: str = "")
             return {"success": False, "error": "No se detecto video real generado", "no_video": True}
 
         log_info("[DESCARGA] Paso 2: Descargando Full Video via menu UI...")
-        file_path = _download_full_video(session, output_dir)
+        file_path = _download_video_from_page(session, output_dir)
         if not file_path:
             return {"success": False, "error": "No se pudo descargar el video via menu UI"}
 
