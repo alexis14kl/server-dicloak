@@ -23,9 +23,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error
-from chat_veo3_videos.veo3_session import Veo3Session, _is_send_blocked, _switch_to_lower_priority
+from chat_veo3_videos.veo3_session import Veo3Session
 
-DEFAULT_VIDEO_DIR = Path(__file__).resolve().parent.parent / "output" / "videos"
+DEFAULT_VIDEO_DIR = Path(__file__).resolve().parent / "videos"
 
 
 # ── Tile: seleccionar video en galeria ──────────────────────────────────────
@@ -336,19 +336,7 @@ def _paste_extend_prompt(session: Veo3Session, prompt: str) -> bool:
 
 
 def _click_send_button(session: Veo3Session) -> bool:
-    """Click en el boton → para enviar. Si esta bloqueado, cambia a lower priority."""
-    log_info("Verificando estado del boton de envio...")
-
-    # Verificar si esta bloqueado antes de intentar
-    if _is_send_blocked(session):
-        log_warn("Envio bloqueado (sin creditos). Cambiando a lower priority...")
-        _switch_to_lower_priority(session)
-        time.sleep(2)
-        # Verificar de nuevo
-        if _is_send_blocked(session):
-            log_error("Envio sigue bloqueado despues de cambiar modelo")
-            return False
-
+    """Click en el boton → (arrow_forward) para enviar."""
     log_info("Buscando boton de envio...")
     result = session.evaluate("""(() => {
         const isVisible = (el) => {
@@ -677,58 +665,6 @@ def extend_video(port: int, prompt: str) -> dict:
         session.close()
 
 
-def _save_artifact(file_path: str, artifact_type: str = "video", meta: dict = None) -> None:
-    """Guarda el video como artifact en la base de datos de publicidad (misma tabla que imagenes)."""
-    try:
-        import sqlite3
-
-        # Buscar DB: env > ~/publicidad > /Users/ipadmini/publicidad
-        db_path_env = os.environ.get("PUBLICIDAD_DB_PATH", "").strip()
-        if db_path_env:
-            db_path = Path(db_path_env)
-        else:
-            candidates = [
-                Path.home() / "publicidad" / "publicidad.sqlite3",
-                Path("/Users/ipadmini/publicidad/publicidad.sqlite3"),
-            ]
-            db_path = next((p for p in candidates if p.exists()), None)
-
-        if not db_path or not db_path.exists():
-            log_warn("[DB] Base de datos de publicidad no encontrada. Configura PUBLICIDAD_DB_PATH en .env")
-            return
-
-        conn = sqlite3.connect(str(db_path))
-        try:
-            # Crear tabla artifacts si no existe (misma estructura que publicidad)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS artifacts (
-                    artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT,
-                    created_at TEXT NOT NULL,
-                    type TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    file_path TEXT NOT NULL,
-                    meta_json TEXT NOT NULL
-                )
-            """)
-
-            import json as _json
-            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            meta_json = _json.dumps(meta or {}, ensure_ascii=False)
-
-            conn.execute(
-                "INSERT INTO artifacts(run_id, created_at, type, content, file_path, meta_json) VALUES (?, ?, ?, ?, ?, ?)",
-                (None, now, artifact_type, "", file_path, meta_json),
-            )
-            conn.commit()
-            log_ok(f"[DB] Video guardado en artifacts: {Path(file_path).name}")
-        finally:
-            conn.close()
-
-    except Exception as e:
-        log_warn(f"[DB] Error guardando artifact: {e}")
-
-
 def download_extended_video(port: int, timeout: int = 600, output_dir: str = "") -> dict:
     """POST /veo3/download-video — Espera extension + descarga Full Video."""
     log_info(f"[DESCARGA] Iniciando descarga en puerto {port} (timeout {timeout}s)")
@@ -744,27 +680,14 @@ def download_extended_video(port: int, timeout: int = 600, output_dir: str = "")
             log_error("[DESCARGA] No se detecto video real generado")
             return {"success": False, "error": "No se detecto video real generado", "no_video": True}
 
-        log_info("[DESCARGA] Paso 2: Descargando video...")
+        log_info("[DESCARGA] Paso 2: Descargando Full Video via menu UI...")
         file_path = _download_video_from_page(session, output_dir)
         if not file_path:
-            return {"success": False, "error": "No se pudo descargar el video"}
+            return {"success": False, "error": "No se pudo descargar el video via menu UI"}
 
         file_size = Path(file_path).stat().st_size
         size_mb = file_size / (1024 * 1024)
         log_ok(f"[DESCARGA] Completado: {Path(file_path).name} ({size_mb:.1f}MB)")
-
-        # Paso 3: Guardar en base de datos de publicidad (tabla artifacts)
-        log_info("[DESCARGA] Paso 3: Guardando en base de datos...")
-        _save_artifact(
-            file_path=file_path,
-            artifact_type="video",
-            meta={
-                "source": "veo3",
-                "port": port,
-                "file_size": file_size,
-                "file_name": Path(file_path).name,
-            },
-        )
 
         return {
             "success": True,
