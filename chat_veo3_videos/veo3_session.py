@@ -503,7 +503,8 @@ def open_new_project(port: int, prompt: str = "") -> dict:
         if prompt and not prompt_sent:
             return {
                 "success": False,
-                "error": "No se pudo enviar el prompt",
+                "error": "No se pudo enviar el prompt despues de 2 intentos (modelo bloqueado)",
+                "needs_account_switch": True,
                 "port": port,
                 "url": project_url or url,
             }
@@ -521,8 +522,20 @@ def open_new_project(port: int, prompt: str = "") -> dict:
 
 
 def _is_send_blocked(session: Veo3Session) -> bool:
-    """Detecta si el boton de envio esta bloqueado (icono naranja/stop = sin creditos)."""
+    """Detecta si el boton de envio esta bloqueado o el selector esta en Nano Banana."""
     result = session.evaluate("""(() => {
+        // Verificar si el selector esta en Nano Banana (modelo de imagen, no video)
+        const selectorBtns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const btn of selectorBtns) {
+            if (!btn.offsetParent) continue;
+            const text = (btn.innerText || '').toLowerCase();
+            const rect = btn.getBoundingClientRect();
+            if (rect.top > window.innerHeight * 0.5
+                && (text.includes('nano') || text.includes('banana'))) {
+                return 'WRONG_MODEL';
+            }
+        }
+
         const btns = Array.from(document.querySelectorAll('button'));
         const sendBtn = btns.find(b => {
             const text = (b.innerText || '').toLowerCase();
@@ -537,73 +550,130 @@ def _is_send_blocked(session: Veo3Session) -> bool:
             || html.includes('block')) return 'BLOCKED';
         return 'OK';
     })()""")
-    return result in ("DISABLED", "BLOCKED", "NO_BUTTON")
+    blocked = result in ("DISABLED", "BLOCKED", "NO_BUTTON", "WRONG_MODEL")
+    if result == "WRONG_MODEL":
+        log_warn("[ENVIO] Selector en Nano Banana (imagen). Necesita cambiar a Video.")
+    return blocked
 
 
 def _switch_to_lower_priority(session: Veo3Session) -> bool:
-    """Cambia el modelo de Veo 3.1 Fast a Veo 3 Fast [lower priority].
+    """Cambia el modelo a Video con Lower Priority.
 
-    Flujo:
-    1. Click en el selector de modelo (dropdown "Video x2" / "Veo 3.1")
-    2. Click en opcion "lower priority" o "Veo 3"
+    Flujo real de la UI (basado en screenshots):
+    1. Click en el selector del modelo (dice "Nano Banana 2 x2" o "Video x2")
+       → abre popup con tabs Image/Video, ratios, multiplicadores, y dropdown de modelo
+    2. Si el tab activo es Image → click en tab "Video"
+    3. Click en dropdown del modelo (dice "Nano Banana 2" o "Veo 3.1 - Fast")
+       → abre lista: Veo 3.1 - Lite, Fast, Fast [Lower Priority], Quality
+    4. Click en "Veo 3.1 - Fast [Lower Priority]"
     """
-    log_info("[MODELO] Cambiando a lower priority...")
+    log_info("[MODELO] Iniciando cambio a Video Lower Priority...")
 
-    # Click en el dropdown del modelo (tiene texto "Video", "Veo", "x2", etc.)
-    clicked = session.evaluate("""(() => {
-        const btns = Array.from(document.querySelectorAll('button, [role="button"], [role="listbox"], [role="combobox"]'));
+    # Paso 1: Click en el selector del modelo (boton en la parte inferior)
+    log_info("[MODELO] Paso 1: Abriendo selector de modelo...")
+    session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
         for (const btn of btns) {
             if (!btn.offsetParent) continue;
             const text = (btn.innerText || '').toLowerCase();
             const rect = btn.getBoundingClientRect();
-            if ((text.includes('veo') || text.includes('video') || text.includes('x2'))
-                && rect.top > window.innerHeight * 0.5) {
+            if (rect.top > window.innerHeight * 0.5 && rect.width > 80
+                && (text.includes('nano') || text.includes('banana')
+                    || text.includes('video') || text.includes('veo')
+                    || text.includes('x2') || text.includes('x1'))) {
                 btn.click();
-                return 'CLICKED: ' + text.substring(0, 30).replace(/\\n/g, ' ');
+                return;
+            }
+        }
+    })()""")
+    time.sleep(2)
+
+    # Paso 2: Verificar si hay tab "Video" y clickearlo
+    # El popup tiene tabs: "Image" / "Video" (o "Imagen" / "Vídeo")
+    log_info("[MODELO] Paso 2: Buscando tab Video...")
+    clicked_video_tab = session.evaluate("""(() => {
+        const all = Array.from(document.querySelectorAll('button, [role="tab"], div, span'));
+        for (const el of all) {
+            if (!el.offsetParent) continue;
+            const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+            const rect = el.getBoundingClientRect();
+            // Tab "Video" / "Vídeo" — debe ser un elemento pequeno (tab), no un boton grande
+            if ((text === 'video' || text === 'vídeo')
+                && rect.width > 40 && rect.width < 200 && rect.height > 20 && rect.height < 60) {
+                el.click();
+                return 'CLICKED: ' + text;
             }
         }
         return 'NOT_FOUND';
     })()""")
 
-    if not clicked or "CLICKED" not in str(clicked):
-        log_warn(f"[MODELO] Selector de modelo no encontrado: {clicked}")
+    if clicked_video_tab and "CLICKED" in str(clicked_video_tab):
+        log_ok(f"[MODELO] Tab Video seleccionado: {clicked_video_tab}")
+    else:
+        log_info("[MODELO] Tab Video no encontrado (puede que ya este en Video)")
+    time.sleep(2)
+
+    # Paso 3: Click en el dropdown del modelo (dice "Veo 3.1 - Fast" o "Nano Banana 2")
+    # Es un dropdown/select DENTRO del popup, no el boton principal
+    log_info("[MODELO] Paso 3: Abriendo dropdown de modelo...")
+    clicked_dropdown = session.evaluate("""(() => {
+        const all = Array.from(document.querySelectorAll(
+            'button, [role="button"], [role="listbox"], [role="combobox"], select'
+        ));
+        for (const el of all) {
+            if (!el.offsetParent) continue;
+            const text = (el.innerText || '').toLowerCase();
+            const rect = el.getBoundingClientRect();
+            // Dropdown del modelo: contiene "veo" o "nano" o "fast" o "lite"
+            // y tiene un icono de flecha (arrow_drop_down)
+            if (rect.width > 100 && rect.height > 30 && rect.height < 60
+                && (text.includes('veo') || text.includes('nano') || text.includes('banana')
+                    || text.includes('fast') || text.includes('lite') || text.includes('quality'))) {
+                el.click();
+                return 'CLICKED: ' + text.replace(/\\n/g, ' ').substring(0, 40);
+            }
+        }
+        return 'NOT_FOUND';
+    })()""")
+
+    if not clicked_dropdown or "CLICKED" not in str(clicked_dropdown):
+        log_warn(f"[MODELO] Dropdown de modelo no encontrado: {clicked_dropdown}")
         return False
-    log_ok(f"[MODELO] Dropdown abierto: {clicked}")
+    log_ok(f"[MODELO] Dropdown abierto: {clicked_dropdown}")
     time.sleep(2)
 
     # Debug: listar opciones del dropdown
     options = session.evaluate("""(() => {
-        const items = Array.from(document.querySelectorAll(
-            '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, div, span'
-        )).filter(el => {
+        const items = Array.from(document.querySelectorAll('*')).filter(el => {
+            if (!el.offsetParent) return false;
+            const text = (el.innerText || '').toLowerCase();
+            const rect = el.getBoundingClientRect();
+            return rect.width > 100 && rect.height > 30 && rect.height < 60
+                && (text.includes('veo') || text.includes('lower') || text.includes('lite')
+                    || text.includes('fast') || text.includes('quality'));
+        });
+        return JSON.stringify(items.map(el => ({
+            text: (el.innerText || '').trim().substring(0, 50),
+            tag: el.tagName,
+        })));
+    })()""")
+    log_info(f"[MODELO] Opciones del dropdown: {options}")
+
+    # Paso 4: Click en "Lower Priority"
+    log_info("[MODELO] Paso 4: Seleccionando Lower Priority...")
+    selected = session.evaluate("""(() => {
+        const items = Array.from(document.querySelectorAll('*')).filter(el => {
             if (!el.offsetParent) return false;
             const rect = el.getBoundingClientRect();
-            return rect.width > 50 && rect.height > 20;
+            return rect.width > 80 && rect.height > 25;
         });
-        return JSON.stringify(items.slice(0, 15).map(el => (el.innerText || '').trim().substring(0, 40)));
-    })()""")
-    log_info(f"[MODELO] Opciones visibles: {options}")
 
-    # Click en "lower priority" o "Veo 3" (no 3.1)
-    selected = session.evaluate("""(() => {
-        const items = Array.from(document.querySelectorAll(
-            '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, div, span'
-        )).filter(el => el.offsetParent !== null);
-
-        // Prioridad 1: "lower priority"
+        // Buscar "Lower Priority" exacto
         for (const item of items) {
             const text = (item.innerText || item.textContent || '').toLowerCase();
-            if (text.includes('lower priority') || text.includes('lower')) {
+            if (text.includes('lower priority')) {
                 item.click();
-                return 'CLICKED: ' + (item.innerText || '').trim().substring(0, 40);
-            }
-        }
-        // Prioridad 2: "Veo 3" sin "3.1" (version anterior con mas creditos)
-        for (const item of items) {
-            const text = (item.innerText || item.textContent || '').toLowerCase();
-            if (text.includes('veo 3') && !text.includes('3.1') && text.length < 30) {
-                item.click();
-                return 'CLICKED: ' + (item.innerText || '').trim().substring(0, 40);
+                return 'CLICKED: ' + (item.innerText || '').trim().substring(0, 50);
             }
         }
         return 'NOT_FOUND';
@@ -694,78 +764,69 @@ def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
 
     log_ok(f"Prompt pegado ({len(content.strip())} chars)")
 
-    # 5. Debug: listar todos los botones en la mitad inferior para entender el DOM
-    btn_debug = session.evaluate("""(() => {
-        const btns = Array.from(document.querySelectorAll('button')).filter(b => {
-            if (!b.offsetParent) return false;
-            return b.getBoundingClientRect().top > window.innerHeight * 0.5;
-        });
-        return JSON.stringify(btns.map(b => ({
-            text: (b.innerText || '').trim().substring(0, 30),
-            disabled: b.disabled,
-            w: Math.round(b.getBoundingClientRect().width),
-            h: Math.round(b.getBoundingClientRect().height),
-        })));
-    })()""")
-    log_info(f"[ENVIO] Botones visibles (mitad inferior): {btn_debug}")
+    # 5. Intentar enviar (hasta 2 intentos: normal + lower priority)
+    for attempt in range(2):
+        attempt_label = "1er intento" if attempt == 0 else "2do intento (lower priority)"
+        log_info(f"[ENVIO] {attempt_label}...")
 
-    # 6. Verificar si el envio esta bloqueado y cambiar modelo
-    blocked = _is_send_blocked(session)
-    log_info(f"[ENVIO] Envio bloqueado: {blocked}")
-    if blocked:
-        log_warn("[ENVIO] Cambiando a lower priority...")
-        _switch_to_lower_priority(session)
-        time.sleep(2)
+        # Verificar si esta bloqueado antes de intentar
+        if _is_send_blocked(session):
+            log_warn(f"[ENVIO] Envio bloqueado. Cambiando a lower priority...")
+            _switch_to_lower_priority(session)
+            time.sleep(2)
 
-    # 7. Click en boton de envio — buscar por multiples indicadores
-    sent = session.evaluate("""(() => {
-        const btns = Array.from(document.querySelectorAll('button')).filter(b => {
-            if (!b.offsetParent) return false;
-            return b.getBoundingClientRect().top > window.innerHeight * 0.5;
-        });
-
-        // Buscar por texto arrow_forward
-        let sendBtn = btns.find(b => (b.innerText || '').includes('arrow_forward'));
-
-        // Buscar por SVG/icono circular pequeno a la derecha (boton →)
-        if (!sendBtn) {
-            sendBtn = btns.find(b => {
-                const rect = b.getBoundingClientRect();
-                const hasSvg = !!b.querySelector('svg, [class*="icon"]');
-                return hasSvg && rect.width >= 24 && rect.width <= 60
-                    && rect.height >= 24 && rect.height <= 60
-                    && rect.left > window.innerWidth * 0.5;
+        # Click en boton de envio
+        sent = session.evaluate("""(() => {
+            const btns = Array.from(document.querySelectorAll('button')).filter(b => {
+                if (!b.offsetParent) return false;
+                return b.getBoundingClientRect().top > window.innerHeight * 0.5;
             });
-        }
 
-        // Buscar por aria-label send/submit
-        if (!sendBtn) {
-            sendBtn = btns.find(b => {
-                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                return aria.includes('send') || aria.includes('submit')
-                    || aria.includes('create') || aria.includes('generar')
-                    || aria.includes('enviar');
-            });
-        }
+            let sendBtn = btns.find(b => (b.innerText || '').includes('arrow_forward'));
 
-        if (sendBtn && !sendBtn.disabled) {
-            sendBtn.click();
-            return 'SENT: ' + (sendBtn.innerText || sendBtn.getAttribute('aria-label') || 'btn').substring(0, 20);
-        }
-        if (sendBtn && sendBtn.disabled) {
-            return 'DISABLED: ' + (sendBtn.innerText || '').substring(0, 20);
-        }
-        return 'NO_BUTTON';
-    })()""")
+            if (!sendBtn) {
+                sendBtn = btns.find(b => {
+                    const rect = b.getBoundingClientRect();
+                    const hasSvg = !!b.querySelector('svg, [class*="icon"]');
+                    return hasSvg && rect.width >= 24 && rect.width <= 60
+                        && rect.height >= 24 && rect.height <= 60
+                        && rect.left > window.innerWidth * 0.5;
+                });
+            }
 
-    log_info(f"[ENVIO] Resultado click: {sent}")
+            if (!sendBtn) {
+                sendBtn = btns.find(b => {
+                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                    return aria.includes('send') || aria.includes('submit')
+                        || aria.includes('create') || aria.includes('generar')
+                        || aria.includes('enviar');
+                });
+            }
 
-    if sent and "SENT" in str(sent):
-        log_ok(f"Prompt enviado: {sent}")
-        return True
+            if (sendBtn && !sendBtn.disabled) {
+                sendBtn.click();
+                return 'SENT: ' + (sendBtn.innerText || sendBtn.getAttribute('aria-label') || 'btn').substring(0, 20);
+            }
+            if (sendBtn && sendBtn.disabled) {
+                return 'DISABLED: ' + (sendBtn.innerText || '').substring(0, 20);
+            }
+            return 'NO_BUTTON';
+        })()""")
 
-    # Si sigue sin poder enviar despues de cambiar modelo, error
-    log_error(f"No se pudo enviar el prompt: {sent}")
+        log_info(f"[ENVIO] Resultado: {sent}")
+
+        if sent and "SENT" in str(sent):
+            log_ok(f"[ENVIO] Prompt enviado: {sent}")
+            return True
+
+        # Primer intento fallo — cambiar a lower priority y reintentar
+        if attempt == 0:
+            log_warn(f"[ENVIO] Fallo ({sent}). Cambiando a lower priority para reintentar...")
+            _switch_to_lower_priority(session)
+            time.sleep(3)
+
+    # Ambos intentos fallaron
+    log_error(f"[ENVIO] No se pudo enviar despues de 2 intentos: {sent}")
     return False
 
 

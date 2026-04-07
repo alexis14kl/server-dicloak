@@ -335,22 +335,9 @@ def _paste_extend_prompt(session: Veo3Session, prompt: str) -> bool:
 # ── Boton enviar ────────────────────────────────────────────────────────────
 
 
-def _click_send_button(session: Veo3Session) -> bool:
-    """Click en el boton → para enviar. Si esta bloqueado, cambia a lower priority."""
-    log_info("Verificando estado del boton de envio...")
-
-    # Verificar si esta bloqueado antes de intentar
-    if _is_send_blocked(session):
-        log_warn("Envio bloqueado (sin creditos). Cambiando a lower priority...")
-        _switch_to_lower_priority(session)
-        time.sleep(2)
-        # Verificar de nuevo
-        if _is_send_blocked(session):
-            log_error("Envio sigue bloqueado despues de cambiar modelo")
-            return False
-
-    log_info("Buscando boton de envio...")
-    result = session.evaluate("""(() => {
+def _try_click_send(session: Veo3Session) -> str:
+    """Intenta click en el boton de envio. Retorna 'CLICKED', 'DISABLED' o 'NOT_FOUND'."""
+    return session.evaluate("""(() => {
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
@@ -370,20 +357,43 @@ def _click_send_button(session: Veo3Session) -> bool:
             if (rect.width >= 24 && rect.width <= 60 && rect.height >= 24 && rect.height <= 60) score += 200000;
             if (btn.querySelector('svg, [class*="icon"]')) score += 50000;
             if (score === 0) return null;
-            return { score, idx: buttons.indexOf(btn) };
+            return { score, idx: buttons.indexOf(btn), disabled: btn.disabled };
         }).filter(Boolean).sort((a, b) => b.score - a.score);
         if (scored.length) {
+            if (scored[0].disabled) return 'DISABLED';
             buttons[scored[0].idx].click();
             return 'CLICKED';
         }
         return 'NOT_FOUND';
-    })()""")
+    })()""") or "NOT_FOUND"
 
-    if result and "CLICKED" in str(result):
-        log_ok("Boton de envio clickeado")
-        return True
 
-    log_error("Boton de envio no encontrado")
+def _click_send_button(session: Veo3Session) -> bool:
+    """Click en el boton → para enviar. Si falla, cambia a lower priority y reintenta 1 vez."""
+    for attempt in range(2):
+        label = "1er intento" if attempt == 0 else "2do intento (lower priority)"
+        log_info(f"[ENVIO] {label}...")
+
+        # Verificar bloqueo antes de intentar
+        if _is_send_blocked(session):
+            log_warn("[ENVIO] Envio bloqueado. Cambiando a lower priority...")
+            _switch_to_lower_priority(session)
+            time.sleep(2)
+
+        result = _try_click_send(session)
+        log_info(f"[ENVIO] Resultado: {result}")
+
+        if "CLICKED" in result:
+            log_ok("[ENVIO] Boton de envio clickeado")
+            return True
+
+        # Primer intento fallo — cambiar modelo y reintentar
+        if attempt == 0:
+            log_warn(f"[ENVIO] Fallo ({result}). Cambiando a lower priority...")
+            _switch_to_lower_priority(session)
+            time.sleep(3)
+
+    log_error(f"[ENVIO] No se pudo enviar despues de 2 intentos: {result}")
     return False
 
 
@@ -660,7 +670,7 @@ def extend_video(port: int, prompt: str) -> dict:
 
         log_info("[EXTENSION] Paso 5: Enviando prompt...")
         if not _click_send_button(session):
-            return {"success": False, "error": "No se pudo enviar el prompt"}
+            return {"success": False, "error": "No se pudo enviar despues de 2 intentos (modelo bloqueado)", "needs_account_switch": True}
 
         final_url = session.evaluate("window.location.href") or ""
         log_ok(f"[EXTENSION] Prompt enviado exitosamente")
