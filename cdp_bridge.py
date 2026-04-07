@@ -333,7 +333,7 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
 
     if scroll_result and "NOT_FOUND" in str(scroll_result):
         log_warn(f"Perfil '{profile_name}' no encontrado en la tabla")
-        return False
+        return "PROFILE_NOT_FOUND"
 
     import time as _time2
     _time2.sleep(1)

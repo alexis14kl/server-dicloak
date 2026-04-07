@@ -500,6 +500,14 @@ def open_new_project(port: int, prompt: str = "") -> dict:
         if prompt:
             prompt_sent = _paste_and_send_prompt(session, prompt)
 
+        if prompt and not prompt_sent:
+            return {
+                "success": False,
+                "error": "No se pudo enviar el prompt",
+                "port": port,
+                "url": project_url or url,
+            }
+
         return {
             "success": True,
             "port": port,
@@ -512,10 +520,107 @@ def open_new_project(port: int, prompt: str = "") -> dict:
         session.close()
 
 
+def _is_send_blocked(session: Veo3Session) -> bool:
+    """Detecta si el boton de envio esta bloqueado (icono naranja/stop = sin creditos)."""
+    result = session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const sendBtn = btns.find(b => {
+            const text = (b.innerText || '').toLowerCase();
+            return (text.includes('arrow_forward') || text.includes('send'))
+                && b.getBoundingClientRect().top > window.innerHeight * 0.5;
+        });
+        if (!sendBtn) return 'NO_BUTTON';
+        if (sendBtn.disabled) return 'DISABLED';
+        const html = (sendBtn.innerHTML || '').toLowerCase();
+        if (html.includes('stop_circle') || html.includes('#ef6c00')
+            || html.includes('#e65100') || html.includes('orange')
+            || html.includes('block')) return 'BLOCKED';
+        return 'OK';
+    })()""")
+    return result in ("DISABLED", "BLOCKED", "NO_BUTTON")
+
+
+def _switch_to_lower_priority(session: Veo3Session) -> bool:
+    """Cambia el modelo de Veo 3.1 Fast a Veo 3 Fast [lower priority].
+
+    Flujo:
+    1. Click en el selector de modelo (dropdown "Video x2" / "Veo 3.1")
+    2. Click en opcion "lower priority" o "Veo 3"
+    """
+    log_info("[MODELO] Cambiando a lower priority...")
+
+    # Click en el dropdown del modelo (tiene texto "Video", "Veo", "x2", etc.)
+    clicked = session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"], [role="listbox"], [role="combobox"]'));
+        for (const btn of btns) {
+            if (!btn.offsetParent) continue;
+            const text = (btn.innerText || '').toLowerCase();
+            const rect = btn.getBoundingClientRect();
+            if ((text.includes('veo') || text.includes('video') || text.includes('x2'))
+                && rect.top > window.innerHeight * 0.5) {
+                btn.click();
+                return 'CLICKED: ' + text.substring(0, 30).replace(/\\n/g, ' ');
+            }
+        }
+        return 'NOT_FOUND';
+    })()""")
+
+    if not clicked or "CLICKED" not in str(clicked):
+        log_warn(f"[MODELO] Selector de modelo no encontrado: {clicked}")
+        return False
+    log_ok(f"[MODELO] Dropdown abierto: {clicked}")
+    time.sleep(2)
+
+    # Debug: listar opciones del dropdown
+    options = session.evaluate("""(() => {
+        const items = Array.from(document.querySelectorAll(
+            '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, div, span'
+        )).filter(el => {
+            if (!el.offsetParent) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 50 && rect.height > 20;
+        });
+        return JSON.stringify(items.slice(0, 15).map(el => (el.innerText || '').trim().substring(0, 40)));
+    })()""")
+    log_info(f"[MODELO] Opciones visibles: {options}")
+
+    # Click en "lower priority" o "Veo 3" (no 3.1)
+    selected = session.evaluate("""(() => {
+        const items = Array.from(document.querySelectorAll(
+            '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, div, span'
+        )).filter(el => el.offsetParent !== null);
+
+        // Prioridad 1: "lower priority"
+        for (const item of items) {
+            const text = (item.innerText || item.textContent || '').toLowerCase();
+            if (text.includes('lower priority') || text.includes('lower')) {
+                item.click();
+                return 'CLICKED: ' + (item.innerText || '').trim().substring(0, 40);
+            }
+        }
+        // Prioridad 2: "Veo 3" sin "3.1" (version anterior con mas creditos)
+        for (const item of items) {
+            const text = (item.innerText || item.textContent || '').toLowerCase();
+            if (text.includes('veo 3') && !text.includes('3.1') && text.length < 30) {
+                item.click();
+                return 'CLICKED: ' + (item.innerText || '').trim().substring(0, 40);
+            }
+        }
+        return 'NOT_FOUND';
+    })()""")
+
+    if selected and "CLICKED" in str(selected):
+        log_ok(f"[MODELO] Modelo cambiado: {selected}")
+        time.sleep(2)
+        return True
+
+    log_warn(f"[MODELO] No se encontro opcion lower priority: {selected}")
+    return False
+
+
 def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
     """Pega un prompt en el chat de Flow y lo envía.
-    Replica el método probado de ChatGPT: focus con Selection/Range,
-    clear con Backspace real, insert con Input.insertText por chunks.
+    Si el envio esta bloqueado, cambia a lower priority y reintenta.
     """
     # Esperar a que el editor esté listo
     for _ in range(10):
@@ -589,22 +694,78 @@ def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
 
     log_ok(f"Prompt pegado ({len(content.strip())} chars)")
 
-    # 5. Click en botón "Create" (arrow_forward) via CDP
+    # 5. Debug: listar todos los botones en la mitad inferior para entender el DOM
+    btn_debug = session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button')).filter(b => {
+            if (!b.offsetParent) return false;
+            return b.getBoundingClientRect().top > window.innerHeight * 0.5;
+        });
+        return JSON.stringify(btns.map(b => ({
+            text: (b.innerText || '').trim().substring(0, 30),
+            disabled: b.disabled,
+            w: Math.round(b.getBoundingClientRect().width),
+            h: Math.round(b.getBoundingClientRect().height),
+        })));
+    })()""")
+    log_info(f"[ENVIO] Botones visibles (mitad inferior): {btn_debug}")
+
+    # 6. Verificar si el envio esta bloqueado y cambiar modelo
+    blocked = _is_send_blocked(session)
+    log_info(f"[ENVIO] Envio bloqueado: {blocked}")
+    if blocked:
+        log_warn("[ENVIO] Cambiando a lower priority...")
+        _switch_to_lower_priority(session)
+        time.sleep(2)
+
+    # 7. Click en boton de envio — buscar por multiples indicadores
     sent = session.evaluate("""(() => {
-        const btns = Array.from(document.querySelectorAll('button'));
-        const createBtn = btns.find(b => (b.innerText || '').includes('arrow_forward'));
-        if (createBtn && !createBtn.disabled) {
-            createBtn.click();
-            return 'SENT';
+        const btns = Array.from(document.querySelectorAll('button')).filter(b => {
+            if (!b.offsetParent) return false;
+            return b.getBoundingClientRect().top > window.innerHeight * 0.5;
+        });
+
+        // Buscar por texto arrow_forward
+        let sendBtn = btns.find(b => (b.innerText || '').includes('arrow_forward'));
+
+        // Buscar por SVG/icono circular pequeno a la derecha (boton →)
+        if (!sendBtn) {
+            sendBtn = btns.find(b => {
+                const rect = b.getBoundingClientRect();
+                const hasSvg = !!b.querySelector('svg, [class*="icon"]');
+                return hasSvg && rect.width >= 24 && rect.width <= 60
+                    && rect.height >= 24 && rect.height <= 60
+                    && rect.left > window.innerWidth * 0.5;
+            });
+        }
+
+        // Buscar por aria-label send/submit
+        if (!sendBtn) {
+            sendBtn = btns.find(b => {
+                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                return aria.includes('send') || aria.includes('submit')
+                    || aria.includes('create') || aria.includes('generar')
+                    || aria.includes('enviar');
+            });
+        }
+
+        if (sendBtn && !sendBtn.disabled) {
+            sendBtn.click();
+            return 'SENT: ' + (sendBtn.innerText || sendBtn.getAttribute('aria-label') || 'btn').substring(0, 20);
+        }
+        if (sendBtn && sendBtn.disabled) {
+            return 'DISABLED: ' + (sendBtn.innerText || '').substring(0, 20);
         }
         return 'NO_BUTTON';
     })()""")
 
+    log_info(f"[ENVIO] Resultado click: {sent}")
+
     if sent and "SENT" in str(sent):
-        log_ok("Prompt enviado")
+        log_ok(f"Prompt enviado: {sent}")
         return True
 
-    log_warn(f"No se pudo enviar el prompt: {sent}")
+    # Si sigue sin poder enviar despues de cambiar modelo, error
+    log_error(f"No se pudo enviar el prompt: {sent}")
     return False
 
 

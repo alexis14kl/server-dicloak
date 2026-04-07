@@ -44,6 +44,7 @@ if env_path.exists():
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 import uvicorn
 
@@ -395,8 +396,12 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI(title="DICloak Control API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Servir imágenes descargadas via /files/images/
+# Servir archivos descargados (imagenes y videos)
 app.mount("/files/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
+
+OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/files/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 
 service = DICloakService(DICLOAK_PORT)
 
