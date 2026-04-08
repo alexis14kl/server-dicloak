@@ -139,8 +139,14 @@ def stabilize_chatgpt(port: int, timeout: int = 30, keep_target_id: str = "") ->
                     log_warn(f"keep_target_id={keep_target_id[:12]} no encontrado, usando ultima tab")
 
             if not keep:
-                # Sin target especifico — quedarse con la ultima (mas reciente)
-                keep = chatgpt_tabs[-1]
+                # Sin target especifico — preferir una conversación /c/... existente
+                convo_tabs = [t for t in chatgpt_tabs if "/c/" in (t.get("url") or "").lower()]
+                if convo_tabs:
+                    keep = convo_tabs[-1]
+                    log_info(f"Manteniendo conversación existente: {keep.get('url', '')[:60]}")
+                else:
+                    # Fallback: quedarse con la ultima (mas reciente)
+                    keep = chatgpt_tabs[-1]
 
             survivor_ws = keep.get("webSocketDebuggerUrl", "")
             to_close = [t for t in chatgpt_tabs if t.get("id") != keep.get("id")]

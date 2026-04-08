@@ -111,6 +111,104 @@ def _check_page_error(port: int) -> str:
     return "UNKNOWN"
 
 
+def _list_chatgpt_targets(port: int) -> list[dict]:
+    """Lista las tabs page de ChatGPT visibles en /json."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as r:
+            targets = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return []
+    return [
+        t for t in targets
+        if t.get("type") == "page" and "chatgpt.com" in (t.get("url") or "").lower()
+    ]
+
+
+def _inspect_chatgpt_tab(ws_url: str) -> dict:
+    """Inspecciona una tab de ChatGPT y detecta si es reutilizable."""
+    if not ws_url:
+        return {"ok": False, "reason": "no_ws"}
+    try:
+        import websockets.sync.client as ws_sync
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
+        import websockets.sync.client as ws_sync
+
+    try:
+        ws = ws_sync.connect(ws_url, max_size=2**20)
+        try:
+            ws.send(json.dumps({
+                "id": 1,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": """
+                        (() => {
+                            const text = (document.body?.innerText || '')
+                                .toLowerCase()
+                                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+                            const href = window.location.href || '';
+                            const title = document.title || '';
+                            const hasEditor = !!document.querySelector('#prompt-textarea[contenteditable="true"]');
+                            const isConnectionError =
+                                text.includes('err_tunnel') ||
+                                text.includes('err_proxy') ||
+                                text.includes('err_connection') ||
+                                text.includes('this site can') ||
+                                text.includes('no se puede acceder') ||
+                                text.includes('este sitio no puede');
+                            return JSON.stringify({
+                                href,
+                                title,
+                                hasEditor,
+                                isConnectionError,
+                            });
+                        })()
+                    """,
+                    "returnByValue": True,
+                }
+            }))
+            resp = json.loads(ws.recv(timeout=5))
+            raw = resp.get("result", {}).get("result", {}).get("value", "{}")
+            data = json.loads(raw) if isinstance(raw, str) else {}
+            href = str(data.get("href") or "")
+            return {
+                "ok": not bool(data.get("isConnectionError")),
+                "href": href,
+                "title": str(data.get("title") or ""),
+                "has_editor": bool(data.get("hasEditor")),
+                "is_conversation": "/c/" in href.lower(),
+            }
+        finally:
+            ws.close()
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
+def _find_reusable_chatgpt_tab(port: int) -> str:
+    """Busca una tab existente de ChatGPT que esté sana, prefiriendo /c/..."""
+    targets = _list_chatgpt_targets(port)
+    if not targets:
+        return ""
+
+    inspected: list[tuple[dict, dict]] = []
+    for target in reversed(targets):
+        ws_url = target.get("webSocketDebuggerUrl", "")
+        info = _inspect_chatgpt_tab(ws_url)
+        inspected.append((target, info))
+
+    for target, info in inspected:
+        if info.get("ok") and info.get("is_conversation"):
+            log_info(f"Reutilizando conversación existente: {info.get('href', target.get('url', ''))[:80]}")
+            return target.get("webSocketDebuggerUrl", "")
+
+    for target, info in inspected:
+        if info.get("ok"):
+            log_info(f"Reutilizando tab ChatGPT existente: {info.get('href', target.get('url', ''))[:80]}")
+            return target.get("webSocketDebuggerUrl", "")
+
+    return ""
+
+
 def _get_browser_ws(port: int) -> str:
     """Obtiene la URL del WebSocket del browser (no del page)."""
     try:
@@ -214,18 +312,23 @@ def ensure_chatgpt_reachable(port: int) -> tuple[int, str]:
       - ws_url: WebSocket URL de la tab correcta ("" si proxy OK y no se creó tab)
     Si falla, retorna (0, "").
     """
+    reusable_ws = _find_reusable_chatgpt_tab(port)
+
     # 1. Verificar si hay proxy y si funciona
     proxy = _get_proxy_from_cmdline(port)
     if proxy:
         log_info(f"Proxy del perfil: {proxy}")
         if _test_proxy(proxy, timeout=8):
             log_ok(f"Proxy vivo — conexion OK")
-            return port, ""
+            return port, reusable_ws
         else:
+            if reusable_ws:
+                log_warn(f"Proxy MUERTO: {proxy} — reutilizando tab ChatGPT ya sana")
+                return port, reusable_ws
             log_warn(f"Proxy MUERTO: {proxy} — creando tab sin proxy...")
     else:
         log_info("Perfil sin proxy — conexion directa")
-        return port, ""
+        return port, reusable_ws
 
     # 2. Proxy muerto: crear tab nueva sin proxy (no confiar en tab existente)
     target_id = create_direct_chatgpt_tab(port, timeout=15)

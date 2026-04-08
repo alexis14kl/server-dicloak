@@ -670,7 +670,74 @@ class ChatGPTSession:
             log_warn("Menú de perfil no apareció con ninguna estrategia")
             return {"switched": False, "reason": "menu_not_found"}
 
-        # 3. Listar cuentas
+        # 3. Abrir el submenú de cuentas/empresa si aún no aparecen las cuentas.
+        radios_ready = self.evaluate("""(() => {
+            return document.querySelectorAll('[role="menuitemradio"]').length > 0 ? 'YES' : 'NO';
+        })()""")
+        if radios_ready != "YES":
+            submenu_result = self.evaluate("""(() => {
+                const normalize = (value) => (value || '')
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '');
+                const rows = Array.from(document.querySelectorAll(
+                    '[role="menuitem"][data-has-submenu], [role="menuitem"][aria-haspopup="menu"]'
+                ));
+                const target = rows.find((el) => {
+                    const text = normalize(el.innerText || '');
+                    if (!text || text.includes('ayuda')) return false;
+                    return text.includes('empresa') || text.includes('enterprise') || text.includes('chatgpt pro');
+                }) || null;
+                if (!target) return 'NO_SUBMENU';
+
+                const rect = target.getBoundingClientRect();
+                const opts = {
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    clientX: rect.x + rect.width / 2,
+                    clientY: rect.y + rect.height / 2,
+                };
+                target.dispatchEvent(new PointerEvent('pointerdown', {...opts, pointerId: 1, pointerType: 'mouse'}));
+                target.dispatchEvent(new MouseEvent('mousedown', opts));
+                target.dispatchEvent(new PointerEvent('pointerup', {...opts, pointerId: 1, pointerType: 'mouse'}));
+                target.dispatchEvent(new MouseEvent('mouseup', opts));
+                target.dispatchEvent(new MouseEvent('click', opts));
+
+                return JSON.stringify({
+                    text: (target.innerText || '').trim(),
+                    ariaExpanded: target.getAttribute('aria-expanded') || '',
+                    dataState: target.getAttribute('data-state') || '',
+                });
+            })()""")
+
+            if not submenu_result or submenu_result == "NO_SUBMENU":
+                log_warn("No se encontró el submenú de cuentas/empresa")
+                return {"switched": False, "reason": "accounts_submenu_missing"}
+
+            try:
+                submenu_info = json.loads(submenu_result)
+                log_info(
+                    "Submenú de cuentas abierto: "
+                    f"{submenu_info.get('text', '')} "
+                    f"(expanded={submenu_info.get('ariaExpanded', '')}, state={submenu_info.get('dataState', '')})"
+                )
+            except Exception:
+                log_info(f"Submenú de cuentas abierto: {submenu_result}")
+
+            for _check in range(8):
+                radios_ready = self.evaluate("""(() => {
+                    return document.querySelectorAll('[role="menuitemradio"]').length > 0 ? 'YES' : 'NO';
+                })()""")
+                if radios_ready == "YES":
+                    break
+                time.sleep(0.5)
+
+            if radios_ready != "YES":
+                log_warn("El submenú abrió pero no aparecieron las cuentas")
+                return {"switched": False, "reason": "accounts_submenu_not_opened"}
+
+        # 4. Listar cuentas
         exhausted_json = json.dumps(list(exhausted_ids))
         accounts_raw = self.evaluate(f"""(() => {{
             const exhausted = {exhausted_json};
@@ -722,7 +789,7 @@ class ChatGPTSession:
             log_warn(f"Sin cuentas disponibles (total disponibles: {available_count})")
             return {"switched": False, "available_count": available_count, "reason": "no_candidates"}
 
-        # 4. Click en primera candidata via CDP (evento real)
+        # 5. Click en primera candidata via CDP (evento real)
         chosen = candidates[0]
         chosen_idx = chosen["index"]
         log_info(f"Cambiando a cuenta: {chosen['label']} (index={chosen_idx})")
@@ -742,11 +809,11 @@ class ChatGPTSession:
             el.dispatchEvent(new MouseEvent('click', opts));
         }})()""")
 
-        # 5. Esperar a que la página termine de navegar
+        # 6. Esperar a que la página termine de navegar
         # (el click en cuenta causa navegación automática a ?account_switch=true)
         time.sleep(6)
 
-        # 6. Reconectar: LIMPIAR ws_url para forzar búsqueda fresca del target
+        # 7. Reconectar: LIMPIAR ws_url para forzar búsqueda fresca del target
         self._ws = None
         self.ws_url = ""
         for _retry in range(5):
@@ -758,7 +825,7 @@ class ChatGPTSession:
             log_warn("No se pudo reconectar tras cambio de cuenta")
             return {"switched": False, "reason": "reconnect_failed", "available_count": available_count}
 
-        # 7. Verificar si ya está en chatgpt.com (el cambio de cuenta navega solo)
+        # 8. Verificar si ya está en chatgpt.com (el cambio de cuenta navega solo)
         #    Solo forzar navegación si NO está en chatgpt.com
         current_url = self.evaluate("window.location.href") or ""
         if "chatgpt.com" not in current_url.lower():
@@ -774,7 +841,7 @@ class ChatGPTSession:
         else:
             log_info(f"Post-switch: ya en ChatGPT ({current_url[:50]})")
 
-        # 8. Esperar editor ready
+        # 9. Esperar editor ready
         self.wait_for_page_ready(timeout_sec=30)
 
         log_ok(f"Cuenta cambiada a: {chosen['label']}")
@@ -1088,11 +1155,19 @@ def paste_and_send_with_rotation(
 
             if not switch_result.get("switched"):
                 reason = switch_result.get("reason", "unknown")
+                error_code = "all_accounts_exhausted" if reason == "no_candidates" else "account_switch_ui_failed"
+                message = (
+                    f"Sin cuentas disponibles: {reason}"
+                    if error_code == "all_accounts_exhausted"
+                    else f"Falló la UI de cambio de cuenta: {reason}"
+                )
                 return {
                     "success": False,
-                    "error": "all_accounts_exhausted",
-                    "message": f"Sin cuentas disponibles: {reason}",
+                    "error": error_code,
+                    "message": message,
                     "rotations": rotations,
+                    "reason": reason,
+                    "available_count": switch_result.get("available_count", 0),
                 }
 
             last_account_id = switch_result.get("account_id", "")
