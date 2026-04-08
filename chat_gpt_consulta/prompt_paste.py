@@ -299,7 +299,7 @@ class ChatGPTSession:
                 time.sleep(2)
                 continue
 
-            # Un solo evaluate: editor ready + rate limit check
+            # Un solo evaluate: editor ready + rate limit check (reduce CDP calls)
             status = self.evaluate("""(() => {
                 const text = (document.body?.innerText || '').toLowerCase();
                 if (text.includes('demasiadas solicitudes') || text.includes('too many requests')
@@ -469,6 +469,7 @@ class ChatGPTSession:
                 return !!(
                     document.querySelector('button[data-testid="stop-button"]')
                     || document.querySelector('button[aria-label="Stop generating"]')
+                    || document.querySelector('button[aria-label="Detener la generación"]')
                 );
             }}
 
@@ -527,12 +528,8 @@ class ChatGPTSession:
     def detect_token_status(self, timeout_sec: int = 90) -> str:
         """Espera la respuesta de ChatGPT sin polling — usa MutationObserver.
 
-        Inyecta UN solo evaluate con awaitPromise=True que:
-          1. Configura MutationObserver en el DOM
-          2. El observer detecta cuando ChatGPT termina (stop button desaparece)
-          3. La Promise resuelve con el estado: SUCCESS, NO_TOKENS, RATE_LIMITED, etc.
-
-        CERO polling, CERO reflows repetidos. Solo 1 lectura de innerText al final.
+        Inyecta UN solo evaluate con awaitPromise=True que resuelve cuando
+        ChatGPT termina de generar. Frases de detección mergeadas de ambas versiones.
 
         Retorna: 'success', 'no_image_tokens', 'session_expired', 'rate_limited'
         """
@@ -541,17 +538,28 @@ class ChatGPTSession:
         result = self.evaluate(f"""
         new Promise((resolve) => {{
             const TIMEOUT = {timeout_ms};
-            const CHECK_INTERVAL = 5000;  // verificar texto cada 5s (solo si idle)
+            const CHECK_INTERVAL = 5000;
 
-            const ratePhrases = ['demasiadas solicitudes', 'too many requests',
-                'rate limit', 'limitado temporalmente', 'temporarily limited'];
-            const tokenPhrases = ['has alcanzado tu limite', 'el limite se restablece',
+            const ratePhrases = [
+                'demasiadas solicitudes', 'too many requests', 'rate limit',
+                'limitado temporalmente', 'temporarily limited',
+                "you've been temporarily restricted", "has been temporarily restricted",
+                'te han restringido temporalmente', 'unusual activity',
+            ];
+            const tokenPhrases = [
+                'has alcanzado tu limite', 'el limite se restablece',
                 'hit the team plan limit', 'hit the plan limit', 'youve hit',
                 'no pude invocar la herramienta de generacion de imagenes',
                 'cannot generate more images', 'image generation limit',
-                'limite de creacion de imagen', 'the limit resets in'];
-            const sessionPhrases = ['tu sesion ha caducado', 'vuelve a iniciar sesion',
-                'your session has expired', 'please log in', 'inicia sesion'];
+                'limite de creacion de imagen', 'the limit resets in',
+                "you've reached your limit", "upgrade your plan",
+                "can't generate images", 'no puedo generar imagenes',
+            ];
+            const sessionPhrases = [
+                'tu sesion ha caducado', 'vuelve a iniciar sesion',
+                'your session has expired', 'please log in', 'inicia sesion',
+                'log in to chatgpt', 'sign in to chatgpt',
+            ];
 
             function checkText() {{
                 const text = (document.body?.innerText || '').toLowerCase()
@@ -587,16 +595,12 @@ class ChatGPTSession:
                 resolve(status);
             }}
 
-            // Check inmediato por si ya hay error visible
             const immediate = checkText();
             if (immediate) {{ done(immediate); return; }}
 
-            // Timer: verificar texto periodicamente (cada 5s, ligero)
             textCheckTimer = setInterval(() => {{
                 const status = checkText();
                 if (status) {{ done(status); return; }}
-
-                // Si no está generando, contar idle
                 if (!isGenerating()) {{
                     idleCount++;
                     if (idleCount >= 3) {{ done('SUCCESS'); }}
@@ -605,10 +609,8 @@ class ChatGPTSession:
                 }}
             }}, CHECK_INTERVAL);
 
-            // MutationObserver: detectar cuando el stop button desaparece
             observer = new MutationObserver(() => {{
                 if (!isGenerating()) {{
-                    // Generacion terminó — esperar 2s y verificar resultado
                     setTimeout(() => {{
                         const status = checkText();
                         done(status || 'SUCCESS');
@@ -617,13 +619,10 @@ class ChatGPTSession:
             }});
 
             observer.observe(document.body, {{
-                childList: true,
-                subtree: true,
-                attributes: true,
+                childList: true, subtree: true, attributes: true,
                 attributeFilter: ['data-testid', 'aria-label', 'role'],
             }});
 
-            // Timeout absoluto
             timeoutTimer = setTimeout(() => {{
                 const status = checkText();
                 done(status || 'SUCCESS');
@@ -741,6 +740,45 @@ class ChatGPTSession:
             return 'NO_BUTTON';
         }})()""")
 
+    def get_current_account_id(self) -> str:
+        """Lee el ID de la cuenta/workspace activa sin abrir el menú.
+
+        Usa el texto visible del botón de perfil como identificador estable.
+        Retorna string vacío si no puede determinarlo.
+        """
+        result = self.evaluate("""(() => {
+            // Patrones que indican aria-label de UI, no nombre de cuenta
+            const SKIP_PATTERNS = [
+                'menu de perfil', 'profile menu', 'open profile menu',
+                'abrir el menu', 'account menu', 'accounts menu',
+            ];
+            const selectors = [
+                '[data-testid="accounts-profile-button"]',
+                '[data-testid="profile-button"]',
+                'button[aria-label*="Account"]',
+                'button[aria-label*="Cuenta"]',
+                'nav button img[alt]',
+            ];
+            for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (!btn) continue;
+                // Preferir innerText (nombre visible de workspace) sobre aria-label (label de UI)
+                const raw = (btn.innerText || '').trim() || (btn.getAttribute('aria-label') || '').trim();
+                if (!raw) continue;
+                const normalized = raw.toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[\\u0300-\\u036f]/g, '')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                // Saltar si es un label de UI genérico, no un nombre de cuenta
+                if (SKIP_PATTERNS.some(p => normalized.includes(p))) continue;
+                if (normalized.length < 2) continue;
+                return 'label:' + normalized;
+            }
+            return '';
+        })()""") or ""
+        return str(result).strip()
+
     def switch_account(self, exhausted_ids: set[str]) -> dict:
         """Abre menú de perfil, lista cuentas, click en una no agotada.
         Retorna dict con switched, account_id, account_label, available_count.
@@ -831,11 +869,12 @@ class ChatGPTSession:
             return document.querySelectorAll('[role="menuitemradio"]').length > 0 ? 'YES' : 'NO';
         })()""")
         if radios_ready != "YES":
-            submenu_result = self.evaluate("""(() => {
+            # Encontrar el elemento de submenú
+            submenu_sel_js = """(() => {
                 const normalize = (value) => (value || '')
                     .toLowerCase()
                     .normalize('NFD')
-                    .replace(/[\\u0300-\\u036f]/g, '');
+                    .replace(/[\u0300-\u036f]/g, '');
                 const rows = Array.from(document.querySelectorAll(
                     '[role="menuitem"][data-has-submenu], [role="menuitem"][aria-haspopup="menu"]'
                 ));
@@ -845,49 +884,79 @@ class ChatGPTSession:
                     return text.includes('empresa') || text.includes('enterprise') || text.includes('chatgpt pro');
                 }) || null;
                 if (!target) return 'NO_SUBMENU';
-
                 const rect = target.getBoundingClientRect();
-                const opts = {
-                    bubbles: true,
-                    cancelable: true,
-                    composed: true,
-                    clientX: rect.x + rect.width / 2,
-                    clientY: rect.y + rect.height / 2,
-                };
-                target.dispatchEvent(new PointerEvent('pointerdown', {...opts, pointerId: 1, pointerType: 'mouse'}));
-                target.dispatchEvent(new MouseEvent('mousedown', opts));
-                target.dispatchEvent(new PointerEvent('pointerup', {...opts, pointerId: 1, pointerType: 'mouse'}));
-                target.dispatchEvent(new MouseEvent('mouseup', opts));
-                target.dispatchEvent(new MouseEvent('click', opts));
-
                 return JSON.stringify({
                     text: (target.innerText || '').trim(),
-                    ariaExpanded: target.getAttribute('aria-expanded') || '',
-                    dataState: target.getAttribute('data-state') || '',
+                    x: rect.x + rect.width / 2,
+                    y: rect.y + rect.height / 2,
                 });
-            })()""")
+            })()"""
 
-            if not submenu_result or submenu_result == "NO_SUBMENU":
+            submenu_pos_raw = self.evaluate(submenu_sel_js)
+            if not submenu_pos_raw or submenu_pos_raw == "NO_SUBMENU":
                 log_warn("No se encontró el submenú de cuentas/empresa")
                 return {"switched": False, "reason": "accounts_submenu_missing"}
 
             try:
-                submenu_info = json.loads(submenu_result)
-                log_info(
-                    "Submenú de cuentas abierto: "
-                    f"{submenu_info.get('text', '')} "
-                    f"(expanded={submenu_info.get('ariaExpanded', '')}, state={submenu_info.get('dataState', '')})"
-                )
+                submenu_pos = json.loads(submenu_pos_raw)
             except Exception:
-                log_info(f"Submenú de cuentas abierto: {submenu_result}")
+                return {"switched": False, "reason": "submenu_parse_error"}
 
-            for _check in range(8):
-                radios_ready = self.evaluate("""(() => {
-                    return document.querySelectorAll('[role="menuitemradio"]').length > 0 ? 'YES' : 'NO';
-                })()""")
+            log_info(f"Abriendo submenú: {submenu_pos.get('text', '')} en ({submenu_pos['x']:.0f}, {submenu_pos['y']:.0f})")
+
+            # Intentar abrir el submenú con múltiples estrategias (Radix es sensible al hover)
+            submenu_strategies = [
+                ("mousemove + click CDP", lambda: (
+                    self._send_raw("Input.dispatchMouseEvent", {
+                        "type": "mouseMoved", "x": submenu_pos["x"], "y": submenu_pos["y"],
+                        "button": "none", "buttons": 0,
+                    }) or
+                    time.sleep(0.3) or
+                    self._cdp_click_at(submenu_pos["x"], submenu_pos["y"])
+                )),
+                ("PointerEvent JS (Radix)", lambda: self.evaluate(f"""(() => {{
+                    const items = Array.from(document.querySelectorAll(
+                        '[role="menuitem"][data-has-submenu], [role="menuitem"][aria-haspopup="menu"]'
+                    ));
+                    const el = items.find(e => e.getBoundingClientRect().x > 0);
+                    if (!el) return;
+                    const r = el.getBoundingClientRect();
+                    const opts = {{bubbles:true,cancelable:true,composed:true,clientX:r.x+r.width/2,clientY:r.y+r.height/2}};
+                    el.dispatchEvent(new PointerEvent('pointerenter', {{...opts,pointerId:1,pointerType:'mouse'}}));
+                    el.dispatchEvent(new PointerEvent('pointermove', {{...opts,pointerId:1,pointerType:'mouse'}}));
+                    el.dispatchEvent(new MouseEvent('mouseover', opts));
+                    el.dispatchEvent(new MouseEvent('mouseenter', opts));
+                    el.dispatchEvent(new PointerEvent('pointerdown', {{...opts,pointerId:1,pointerType:'mouse'}}));
+                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                    el.dispatchEvent(new PointerEvent('pointerup', {{...opts,pointerId:1,pointerType:'mouse'}}));
+                    el.dispatchEvent(new MouseEvent('mouseup', opts));
+                    el.dispatchEvent(new MouseEvent('click', opts));
+                }})()""")),
+                ("focus + ArrowRight", lambda: self.evaluate("""(() => {
+                    const items = Array.from(document.querySelectorAll(
+                        '[role="menuitem"][data-has-submenu], [role="menuitem"][aria-haspopup="menu"]'
+                    ));
+                    const el = items.find(e => e.getBoundingClientRect().x > 0);
+                    if (el) el.focus();
+                })()""") or self._send_raw("Input.dispatchKeyEvent", {
+                    "type": "keyDown", "key": "ArrowRight", "code": "ArrowRight",
+                    "windowsVirtualKeyCode": 39, "nativeVirtualKeyCode": 39,
+                })),
+            ]
+
+            for strat_name, strat_action in submenu_strategies:
+                log_info(f"Intentando abrir submenú: {strat_name}")
+                strat_action()
+                for _check in range(8):
+                    radios_ready = self.evaluate("""(() => {
+                        return document.querySelectorAll('[role="menuitemradio"]').length > 0 ? 'YES' : 'NO';
+                    })()""")
+                    if radios_ready == "YES":
+                        break
+                    time.sleep(0.5)
                 if radios_ready == "YES":
+                    log_ok(f"Submenú abierto con: {strat_name}")
                     break
-                time.sleep(0.5)
 
             if radios_ready != "YES":
                 log_warn("El submenú abrió pero no aparecieron las cuentas")
@@ -904,7 +973,8 @@ class ChatGPTSession:
             const accounts = items.map((el, i) => {{
                 const text = (el.innerText || '').trim();
                 const normalized = text.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
-                const accountId = 'slot:' + i + '|label:' + (normalized || 'sin_texto');
+                // Usar label normalizado como ID estable (no el slot/índice que puede cambiar de orden)
+                const accountId = 'label:' + (normalized || 'slot_' + i);
                 const ariaChecked = el.getAttribute('aria-checked') === 'true';
                 const dataChecked = el.getAttribute('data-state') === 'checked';
                 const hasCheckmark = !!el.querySelector('svg.icon-sm') || !!el.querySelector('.trailing svg');
@@ -1265,8 +1335,25 @@ def paste_and_send_with_rotation(
             # Esperar página lista (60s para dar tiempo a que cargue)
             if not session.wait_for_page_ready(timeout_sec=60):
                 if session.last_error == "rate_limited":
+                    log_warn("Rate limit en page_ready — intentando rotar cuenta antes de rendirse...")
+                    if last_account_id:
+                        mark_exhausted(port, last_account_id, last_account_label)
+                    exhausted = get_exhausted_ids(port)
+                    switch_result = session.switch_account(exhausted)
+                    if switch_result.get("switched"):
+                        last_account_id = ""
+                        last_account_label = ""
+                        rotations += 1
+                        log_ok(f"Rotación #{rotations} tras rate limit en page_ready.")
+                        time.sleep(3)
+                        continue
                     return _rate_limited_result(session, rotations=rotations)
                 return {"success": False, "error": "ChatGPT no cargó completamente"}
+
+            # Leer cuenta activa actual antes de enviar (para poder marcarla si falla)
+            if not last_account_id:
+                last_account_id = session.get_current_account_id()
+                last_account_label = last_account_id
 
             # Pegar prompt
             if not session.paste_prompt(prompt):
@@ -1277,6 +1364,18 @@ def paste_and_send_with_rotation(
             # Enviar
             if not session.send_prompt():
                 if session.last_error == "rate_limited":
+                    log_warn("Rate limit al enviar — intentando rotar cuenta...")
+                    if last_account_id:
+                        mark_exhausted(port, last_account_id, last_account_label)
+                    exhausted = get_exhausted_ids(port)
+                    switch_result = session.switch_account(exhausted)
+                    if switch_result.get("switched"):
+                        last_account_id = ""
+                        last_account_label = ""
+                        rotations += 1
+                        log_ok(f"Rotación #{rotations} tras rate limit en envío.")
+                        time.sleep(3)
+                        continue
                     return _rate_limited_result(session, rotations=rotations)
                 return {"success": False, "error": "No se pudo enviar el prompt"}
 
@@ -1284,7 +1383,7 @@ def paste_and_send_with_rotation(
             status = session.detect_token_status(timeout_sec=timeout)
 
             if status == "success":
-                # Limpiar cuenta previa si funcionó
+                # Limpiar cuenta activa de exhausted si funcionó
                 if last_account_id:
                     clear_exhausted(port, last_account_id)
 
@@ -1312,9 +1411,27 @@ def paste_and_send_with_rotation(
                 }
 
             if status == "rate_limited":
+                # Antes de rendirse, intentar rotar cuenta dentro del mismo perfil.
+                # Manualmente esto quita el rate limit — el rate limit es por cuenta,
+                # no por perfil DICloak completo.
+                log_warn("Rate limit detectado — intentando rotar cuenta antes de rendirse...")
+                if last_account_id:
+                    mark_exhausted(port, last_account_id, last_account_label)
+                    log_info(f"Cuenta rate-limited marcada: {last_account_label or last_account_id}")
+                exhausted = get_exhausted_ids(port)
+                switch_result = session.switch_account(exhausted)
+                if switch_result.get("switched"):
+                    last_account_id = ""
+                    last_account_label = ""
+                    rotations += 1
+                    log_ok(f"Rotación #{rotations} tras rate limit: {switch_result.get('account_label', '')}")
+                    time.sleep(3)
+                    continue  # reintentar con la nueva cuenta
+                # Sin cuentas disponibles para rotar → rate limit real
+                log_warn("Sin cuentas disponibles para rotar tras rate limit.")
                 return _rate_limited_result(session, rotations=rotations)
 
-            # no_image_tokens → marcar cuenta y rotar
+            # no_image_tokens → marcar cuenta actual y rotar
             if last_account_id:
                 mark_exhausted(port, last_account_id, last_account_label)
                 log_info(f"Cuenta agotada marcada: {last_account_label or last_account_id}")
@@ -1322,6 +1439,9 @@ def paste_and_send_with_rotation(
             log_info("Tokens agotados. Rotando cuenta...")
             exhausted = get_exhausted_ids(port)
             switch_result = session.switch_account(exhausted)
+            # Resetear para que el próximo intento lea la nueva cuenta activa
+            last_account_id = ""
+            last_account_label = ""
 
             if not switch_result.get("switched"):
                 reason = switch_result.get("reason", "unknown")
