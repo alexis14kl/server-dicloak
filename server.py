@@ -336,6 +336,7 @@ class PromptRequest(BaseModel):
     wait_response: bool = False
     timeout: int = 120
     auto_rotate: bool = True
+    paste_only: bool = False
 
     @field_validator("prompt")
     @classmethod
@@ -343,6 +344,12 @@ class PromptRequest(BaseModel):
         if not v or not v.strip():
             raise ValueError("El prompt no puede estar vacío")
         return v.strip()
+
+class SendPastedPromptRequest(BaseModel):
+    port: int
+    wait_response: bool = False
+    timeout: int = 120
+    target_ws: str = ""
 
 class ImageDownloadRequest(BaseModel):
     port: int
@@ -429,6 +436,7 @@ def index():
             "POST /profiles/hook",
             "POST /chatgpt/stabilize",
             "POST /chatgpt/prompt",
+            "POST /chatgpt/send-pasted",
             "POST /chatgpt/download-image",
             "POST /veo3/stabilize",
             "POST /veo3/new-project",
@@ -560,7 +568,14 @@ def chatgpt_prompt(req: PromptRequest):
         except Exception as e:
             log_warn(f"Stabilize fallo (no critico): {e}")
 
-        if req.auto_rotate:
+        if req.paste_only:
+            from chat_gpt_consulta.prompt_paste import paste_prompt_only
+            result = paste_prompt_only(
+                port=port,
+                prompt=req.prompt,
+                target_ws=tab_ws,
+            )
+        elif req.auto_rotate:
             from chat_gpt_consulta.prompt_paste import paste_and_send_with_rotation
             result = paste_and_send_with_rotation(
                 port=port,
@@ -579,7 +594,25 @@ def chatgpt_prompt(req: PromptRequest):
                 target_ws=tab_ws,
             )
         if result.get("success"):
-            return success_response(data=result, message="Prompt enviado a ChatGPT")
+            message = "Prompt pegado en ChatGPT" if req.paste_only else "Prompt enviado a ChatGPT"
+            return success_response(data=result, message=message)
+        return error_response(result.get("error", "Error desconocido"), 500, details=result)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+@app.post("/chatgpt/send-pasted")
+def chatgpt_send_pasted(req: SendPastedPromptRequest):
+    try:
+        from chat_gpt_consulta.prompt_paste import send_pasted_prompt
+        result = send_pasted_prompt(
+            port=req.port,
+            wait_response=req.wait_response,
+            timeout=req.timeout,
+            target_ws=req.target_ws,
+        )
+        if result.get("success"):
+            return success_response(data=result, message="Prompt pegado enviado a ChatGPT")
         return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)

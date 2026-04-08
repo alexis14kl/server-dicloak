@@ -158,6 +158,24 @@ class ChatGPTSession:
         })()""")
         return result == "YES"
 
+    def _check_rate_limited(self) -> bool:
+        """Verifica si ChatGPT muestra el modal de 'Demasiadas solicitudes'."""
+        result = self.evaluate("""(() => {
+            const text = (document.body?.innerText || '').toLowerCase()
+                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+            const phrases = [
+                'demasiadas solicitudes',
+                'too many requests',
+                'estas haciendo solicitudes demasiado rapido',
+                'youre sending messages too quickly',
+                'rate limit',
+                'limitado temporalmente',
+                'temporarily limited',
+            ];
+            return phrases.some(p => text.includes(p)) ? 'YES' : 'NO';
+        })()""")
+        return result == "YES"
+
     # ── Acciones de ChatGPT ──────────────────────────────────────────────
 
     def wait_for_page_ready(self, timeout_sec: int = 60) -> bool:
@@ -191,6 +209,18 @@ class ChatGPTSession:
             if title == "about:blank":
                 time.sleep(1)
                 continue
+
+            # Detectar modal de rate limit y cerrarlo
+            if self._check_rate_limited():
+                log_warn("Rate limit detectado en page_ready — cerrando modal y esperando 30s...")
+                self.evaluate("""(() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const ok = btns.find(b => /entendido|understood|ok|got it/i.test(b.innerText));
+                    if (ok) ok.click();
+                })()""")
+                time.sleep(30)
+                continue
+
             # Verificar que el editor esté listo
             ready = self.evaluate("""(() => {
                 const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
@@ -361,14 +391,13 @@ class ChatGPTSession:
     # ── Detección de tokens y sesión ─────────────────────────────────────
 
     def detect_token_status(self, timeout_sec: int = 90) -> str:
-        """Espera la respuesta de ChatGPT y detecta si hay error de tokens o sesión.
+        """Espera la respuesta de ChatGPT y detecta si hay error de tokens, sesión o rate limit.
 
-        Retorna: 'success', 'no_image_tokens', 'session_expired'
+        Retorna: 'success', 'no_image_tokens', 'session_expired', 'rate_limited'
 
         Flujo simplificado:
           1. Esperar que ChatGPT termine de generar (stop button desaparece)
-          2. Verificar si la respuesta es un error de tokens
-        No depende de contar turns (frágil con timeouts CDP).
+          2. Verificar si la respuesta es un error de tokens/rate limit
         """
         deadline = time.time() + timeout_sec
 
@@ -378,6 +407,17 @@ class ChatGPTSession:
         # ── Fase única: Monitorear estado de generación ──────────────────
         idle_cycles = 0
         while time.time() < deadline:
+            if self._check_rate_limited():
+                log_warn("Rate limit detectado — esperando 60s antes de continuar...")
+                # Click en "Entendido" si existe
+                self.evaluate("""(() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const ok = btns.find(b => /entendido|understood|ok|got it/i.test(b.innerText));
+                    if (ok) ok.click();
+                })()""")
+                time.sleep(60)
+                return "rate_limited"
+
             if self._check_no_tokens():
                 return "no_image_tokens"
 
@@ -406,6 +446,8 @@ class ChatGPTSession:
 
         # ── Verificación final ───────────────────────────────────────────
         time.sleep(1)
+        if self._check_rate_limited():
+            return "rate_limited"
         if self._check_no_tokens():
             return "no_image_tokens"
         if self._check_session_expired():
@@ -663,11 +705,12 @@ class ChatGPTSession:
         }})()""")
 
         # 5. Esperar a que la página termine de navegar
+        # (el click en cuenta causa navegación automática a ?account_switch=true)
         time.sleep(6)
 
         # 6. Reconectar: LIMPIAR ws_url para forzar búsqueda fresca del target
         self._ws = None
-        self.ws_url = ""  # <-- CLAVE: forzar _find_chatgpt_target() en vez de reusar URL viejo
+        self.ws_url = ""
         for _retry in range(5):
             if self.connect():
                 break
@@ -677,17 +720,21 @@ class ChatGPTSession:
             log_warn("No se pudo reconectar tras cambio de cuenta")
             return {"switched": False, "reason": "reconnect_failed", "available_count": available_count}
 
-        # 7. Navegar a chat limpio
-        self.evaluate("window.location.href = 'https://chatgpt.com/'")
-        time.sleep(5)
-
-        # Reconectar de nuevo (la navegación rompe el WS otra vez)
-        self._ws = None
-        self.ws_url = ""
-        for _retry in range(5):
-            if self.connect():
-                break
-            time.sleep(3)
+        # 7. Verificar si ya está en chatgpt.com (el cambio de cuenta navega solo)
+        #    Solo forzar navegación si NO está en chatgpt.com
+        current_url = self.evaluate("window.location.href") or ""
+        if "chatgpt.com" not in current_url.lower():
+            log_info("Post-switch: no en ChatGPT, navegando...")
+            self.evaluate("window.location.href = 'https://chatgpt.com/'")
+            time.sleep(5)
+            self._ws = None
+            self.ws_url = ""
+            for _retry in range(5):
+                if self.connect():
+                    break
+                time.sleep(3)
+        else:
+            log_info(f"Post-switch: ya en ChatGPT ({current_url[:50]})")
 
         # 8. Esperar editor ready
         self.wait_for_page_ready(timeout_sec=30)
@@ -770,7 +817,116 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True,
         session.close()
 
 
-MAX_ROTATION_ATTEMPTS = 20
+def paste_prompt_only(port: int, prompt: str, target_ws: str = "") -> dict:
+    """
+    Pega un prompt en ChatGPT sin enviarlo.
+
+    Devuelve target_ws para que un paso posterior pueda reutilizar la misma tab
+    y enviar el prompt más tarde.
+    """
+    session = ChatGPTSession(port=port)
+
+    if target_ws:
+        session.ws_url = target_ws
+        try:
+            import websockets.sync.client as ws_sync
+            session._ws = ws_sync.connect(target_ws, max_size=2**22)
+            log_ok(f"Conectado directo a tab: ...{target_ws[-40:]}")
+        except Exception as e:
+            log_warn(f"No se pudo conectar a target_ws: {e}")
+            if not session.connect():
+                return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+    elif not session.connect():
+        return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+
+    try:
+        if not session.wait_for_page_ready(timeout_sec=30):
+            return {"success": False, "error": "ChatGPT no cargó completamente"}
+
+        if not session.paste_prompt(prompt):
+            return {"success": False, "error": "No se pudo pegar el prompt"}
+
+        return {
+            "success": True,
+            "port": port,
+            "prompt_length": len(prompt),
+            "pasted": True,
+            "sent": False,
+            "target_ws": session.ws_url,
+        }
+    finally:
+        session.close()
+
+
+def send_pasted_prompt(
+    port: int,
+    wait_response: bool = True,
+    timeout: int = 120,
+    target_ws: str = "",
+) -> dict:
+    """
+    Envía un prompt que ya está pegado en el editor de ChatGPT.
+
+    Reutiliza la misma tab cuando target_ws está disponible y valida que aún
+    haya contenido en el editor antes de intentar enviar.
+    """
+    session = ChatGPTSession(port=port)
+
+    if target_ws:
+        session.ws_url = target_ws
+        try:
+            import websockets.sync.client as ws_sync
+            session._ws = ws_sync.connect(target_ws, max_size=2**22)
+            log_ok(f"Conectado directo a tab: ...{target_ws[-40:]}")
+        except Exception as e:
+            log_warn(f"No se pudo conectar a target_ws: {e}")
+            if not session.connect():
+                return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+    elif not session.connect():
+        return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
+
+    try:
+        if not session.wait_for_page_ready(timeout_sec=30):
+            return {"success": False, "error": "ChatGPT no cargó completamente"}
+
+        editor_text = session.evaluate("""(() => {
+            const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
+            return (editor?.innerText || '').trim();
+        })()""") or ""
+        if len(str(editor_text).strip()) < 3:
+            return {
+                "success": False,
+                "error": "prompt_not_pasted",
+                "message": "No hay prompt pegado en el editor",
+                "target_ws": session.ws_url,
+            }
+
+        if not session.send_prompt():
+            return {"success": False, "error": "No se pudo enviar el prompt"}
+
+        result = {
+            "success": True,
+            "port": port,
+            "prompt_length": len(str(editor_text)),
+            "pasted": True,
+            "sent": True,
+            "target_ws": session.ws_url,
+        }
+
+        if wait_response:
+            if session.wait_for_response(timeout_sec=timeout):
+                result["response"] = session.get_last_response()
+                result["response_complete"] = True
+            else:
+                result["response"] = session.get_last_response()
+                result["response_complete"] = False
+
+        return result
+    finally:
+        session.close()
+
+
+MAX_ROTATION_ATTEMPTS = 5
 
 
 def paste_and_send_with_rotation(
@@ -848,6 +1004,12 @@ def paste_and_send_with_rotation(
                     "message": "La sesión de ChatGPT expiró. Cambiar perfil DiCloak.",
                     "rotations": rotations,
                 }
+
+            if status == "rate_limited":
+                # NO rotar — backoff y reintentar en la misma cuenta
+                log_warn("Rate limit detectado. Esperando 60s y reintentando...")
+                time.sleep(60)
+                continue
 
             # no_image_tokens → marcar cuenta y rotar
             if last_account_id:

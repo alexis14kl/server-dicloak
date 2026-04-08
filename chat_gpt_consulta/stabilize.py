@@ -159,7 +159,7 @@ def stabilize_chatgpt(port: int, timeout: int = 30, keep_target_id: str = "") ->
 
             time.sleep(1)
 
-        # Ahora navegar la tab superviviente a chatgpt.com/ limpio
+        # Verificar que la tab superviviente está funcional (sin navegar de nuevo)
         if survivor_ws:
             try:
                 page_ws = ws_sync.connect(survivor_ws, max_size=2**22)
@@ -175,12 +175,28 @@ def stabilize_chatgpt(port: int, timeout: int = 30, keep_target_id: str = "") ->
                         if resp.get("id") == page_msg_id:
                             return resp
 
-                # Navegar a chat limpio
-                page_cdp("Page.navigate", {"url": "https://chatgpt.com/"})
-                log_info("Navegando a https://chatgpt.com/...")
-                time.sleep(3)
+                # Verificar estado actual — solo navegar si la tab NO está en chatgpt.com
+                page_msg_id += 1
+                page_ws.send(json.dumps({
+                    "id": page_msg_id,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "window.location.href", "returnByValue": True}
+                }))
+                try:
+                    resp = json.loads(page_ws.recv(timeout=5))
+                    current_url = resp.get("result", {}).get("result", {}).get("value", "")
+                except Exception:
+                    current_url = ""
 
-                # Esperar que el editor este listo
+                if "chatgpt.com" not in current_url.lower():
+                    # Solo navegar si no está en ChatGPT
+                    page_cdp("Page.navigate", {"url": "https://chatgpt.com/"})
+                    log_info("Tab no estaba en ChatGPT, navegando...")
+                    time.sleep(3)
+                else:
+                    log_info(f"Tab ya en ChatGPT: {current_url[:60]}")
+
+                # Esperar que el editor esté listo
                 deadline = time.time() + timeout
                 editor_ready = False
                 while time.time() < deadline:
