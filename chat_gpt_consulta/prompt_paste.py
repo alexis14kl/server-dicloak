@@ -603,12 +603,24 @@ class ChatGPTSession:
                 const normalized = text.toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
                 const accountId = 'slot:' + i + '|label:' + (normalized || 'sin_texto');
                 const ariaChecked = el.getAttribute('aria-checked') === 'true';
-                const hasCheckmark = !!el.querySelector('.trailing svg.icon-sm');
-                const looksCurrent = ariaChecked || hasCheckmark
-                    || currentText.includes(normalized.substring(0, 10));
-                const excluded = exhausted.includes(accountId);
-                return {{index: i, accountId, label: text, looksCurrent, excluded}};
+                const dataChecked = el.getAttribute('data-state') === 'checked';
+                const hasCheckmark = !!el.querySelector('svg.icon-sm') || !!el.querySelector('.trailing svg');
+                return {{index: i, accountId, label: text, normalized, ariaChecked, dataChecked, hasCheckmark}};
             }});
+
+            // Detectar cuenta actual: primero por señales fuertes (aria/data/checkmark).
+            // Solo usar text match si NINGUNA cuenta tiene señal fuerte.
+            const hasStrongSignal = accounts.some(a => a.ariaChecked || a.dataChecked || a.hasCheckmark);
+
+            for (const a of accounts) {{
+                if (hasStrongSignal) {{
+                    a.looksCurrent = a.ariaChecked || a.dataChecked || a.hasCheckmark;
+                }} else {{
+                    // Fallback: text match solo si no hay señales fuertes
+                    a.looksCurrent = a.normalized.length > 3 && currentText.includes(a.normalized);
+                }}
+                a.excluded = exhausted.includes(a.accountId);
+            }}
 
             const available = accounts.filter(a => !a.looksCurrent);
             const candidates = available.filter(a => !a.excluded);

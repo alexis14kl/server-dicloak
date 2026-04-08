@@ -544,6 +544,22 @@ def chatgpt_prompt(req: PromptRequest):
         if not port:
             return error_response("Proxy muerto y no se pudo crear bypass", 503)
 
+        # Estabilizar: cerrar tabs duplicadas DESPUES de proxy_bypass
+        # Proteger la tab que proxy_bypass creó (tab_ws) — cerrar las demás
+        try:
+            from chat_gpt_consulta.stabilize import stabilize_chatgpt
+            # Extraer el targetId de tab_ws para protegerla
+            keep_id = ""
+            if tab_ws:
+                # ws URL format: .../devtools/page/TARGET_ID
+                keep_id = tab_ws.rsplit("/", 1)[-1] if "/page/" in tab_ws else ""
+            stab = stabilize_chatgpt(port=port, timeout=15, keep_target_id=keep_id)
+            closed = stab.get("tabs_closed", 0)
+            if closed:
+                log_info(f"Stabilize: {closed} tabs cerradas antes del prompt")
+        except Exception as e:
+            log_warn(f"Stabilize fallo (no critico): {e}")
+
         if req.auto_rotate:
             from chat_gpt_consulta.prompt_paste import paste_and_send_with_rotation
             result = paste_and_send_with_rotation(

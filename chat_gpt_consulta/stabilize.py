@@ -39,7 +39,7 @@ def _list_targets(port: int) -> list[dict]:
         return []
 
 
-def stabilize_chatgpt(port: int, timeout: int = 30) -> dict:
+def stabilize_chatgpt(port: int, timeout: int = 30, keep_target_id: str = "") -> dict:
     """
     Estabiliza la sesion de ChatGPT:
       - Cierra todas las tabs de ChatGPT excepto una
@@ -49,6 +49,8 @@ def stabilize_chatgpt(port: int, timeout: int = 30) -> dict:
     Args:
         port: Puerto CDP del navegador (ginsbrowser)
         timeout: Tiempo max para esperar que ChatGPT cargue
+        keep_target_id: Si se pasa, proteger esta tab y cerrar las demas.
+                        Util cuando proxy_bypass ya creo una tab nueva.
 
     Returns:
         dict con success, tabs_closed, target_ws, message
@@ -123,11 +125,25 @@ def stabilize_chatgpt(port: int, timeout: int = 30) -> dict:
             log_info("Ya hay exactamente 1 tab de ChatGPT, no hay que cerrar nada.")
 
         else:
-            # Multiples tabs — quedarse con la ultima y cerrar el resto
-            # La ultima es la mas reciente (orden en /json)
-            keep = chatgpt_tabs[-1]
+            # Multiples tabs — determinar cual mantener
+            keep = None
+            if keep_target_id:
+                # Proteger la tab especifica (creada por proxy_bypass)
+                for t in chatgpt_tabs:
+                    if t.get("id", "") == keep_target_id:
+                        keep = t
+                        break
+                if keep:
+                    log_info(f"Protegiendo tab de proxy_bypass: {keep_target_id[:12]}")
+                else:
+                    log_warn(f"keep_target_id={keep_target_id[:12]} no encontrado, usando ultima tab")
+
+            if not keep:
+                # Sin target especifico — quedarse con la ultima (mas reciente)
+                keep = chatgpt_tabs[-1]
+
             survivor_ws = keep.get("webSocketDebuggerUrl", "")
-            to_close = chatgpt_tabs[:-1]
+            to_close = [t for t in chatgpt_tabs if t.get("id") != keep.get("id")]
 
             log_info(f"Cerrando {len(to_close)} tabs duplicadas, manteniendo: {keep.get('url', '')[:60]}")
 
