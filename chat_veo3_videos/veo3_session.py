@@ -688,10 +688,127 @@ def _switch_to_lower_priority(session: Veo3Session) -> bool:
     return False
 
 
+def _ensure_video_lower_priority(session: Veo3Session) -> bool:
+    """Configura el modelo a Veo 3.1 Fast [Lower Priority] ANTES de pegar/enviar.
+
+    Funciona en 2 contextos:
+    - New project: selector "Nano Banana 2 x2" → popup con tabs Image/Video → dropdown
+    - Extension: selector "Veo 3.1 - Lite" → dropdown directo (sin popup con tabs)
+    """
+    # Verificar si ya esta en Lower Priority
+    current = session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of btns) {
+            if (!b.offsetParent) continue;
+            const text = (b.innerText || '').toLowerCase();
+            if (text.includes('lower priority')) return 'ALREADY_OK';
+            if (b.getBoundingClientRect().top > window.innerHeight * 0.5
+                && (text.includes('veo') || text.includes('nano') || text.includes('banana')
+                    || text.includes('x2') || text.includes('x1') || text.includes('lite')
+                    || text.includes('fast') || text.includes('quality'))) {
+                return 'NEEDS_CHANGE: ' + text.replace(/\\n/g, ' ').substring(0, 40);
+            }
+        }
+        return 'NO_SELECTOR';
+    })()""")
+    log_info(f"[MODELO] Estado actual: {current}")
+
+    if current and "ALREADY_OK" in str(current):
+        log_ok("[MODELO] Ya esta en Lower Priority")
+        return True
+
+    log_info("[MODELO] Cambiando a Video + Lower Priority...")
+
+    # Paso 1: Click en el selector del modelo
+    session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of btns) {
+            if (!b.offsetParent) continue;
+            const text = (b.innerText || '').toLowerCase();
+            const rect = b.getBoundingClientRect();
+            if (rect.top > window.innerHeight * 0.5
+                && (text.includes('x2') || text.includes('x1') || text.includes('x3')
+                    || text.includes('banana') || text.includes('nano')
+                    || text.includes('veo') || text.includes('lite')
+                    || text.includes('fast') || text.includes('quality')
+                    || text.includes('video') || text.includes('vídeo'))) {
+                b.click();
+                return;
+            }
+        }
+    })()""")
+    time.sleep(2)
+
+    # Paso 2: Si hay tab "Video" clickearlo (solo en new-project, no en extension)
+    session.evaluate("""(() => {
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+            if (!el.offsetParent) continue;
+            const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+            const rect = el.getBoundingClientRect();
+            if ((text === 'video' || text === 'vídeo')
+                && rect.width > 40 && rect.width < 200
+                && rect.height > 15 && rect.height < 60
+                && el.children.length <= 3) {
+                el.click();
+                return;
+            }
+        }
+    })()""")
+    time.sleep(2)
+
+    # Paso 3: Click en el dropdown del modelo (puede ser dentro del popup o directo)
+    session.evaluate("""(() => {
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+            if (!el.offsetParent) continue;
+            const text = (el.innerText || '').toLowerCase();
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 150 && rect.height > 25 && rect.height < 60
+                && (text.includes('veo 3') || text.includes('nano banana')
+                    || text.includes('fast') || text.includes('lite') || text.includes('quality'))
+                && !text.includes('lower priority')) {
+                el.click();
+                return;
+            }
+        }
+    })()""")
+    time.sleep(2)
+
+    # Paso 4: Click en "Lower Priority"
+    selected = session.evaluate("""(() => {
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+            if (!el.offsetParent) continue;
+            const text = (el.innerText || el.textContent || '');
+            if (text.toLowerCase().includes('lower priority') && text.length < 60) {
+                el.click();
+                return 'CLICKED: ' + text.trim().substring(0, 50);
+            }
+        }
+        return 'NOT_FOUND';
+    })()""")
+
+    if selected and "CLICKED" in str(selected):
+        log_ok(f"[MODELO] Lower Priority seleccionado: {selected}")
+    else:
+        log_warn(f"[MODELO] Lower Priority no encontrado: {selected}")
+    time.sleep(1)
+
+    # Cerrar popup
+    session.evaluate("document.querySelector('[contenteditable=\"true\"]')?.click()")
+    time.sleep(0.5)
+
+    return selected and "CLICKED" in str(selected)
+
+
 def _paste_and_send_prompt(session: Veo3Session, prompt: str) -> bool:
     """Pega un prompt en el chat de Flow y lo envía.
-    Si el envio esta bloqueado, cambia a lower priority y reintenta.
+    Antes de pegar, configura Video + Lower Priority.
     """
+    # Paso 0: Configurar modelo a Video + Lower Priority
+    _ensure_video_lower_priority(session)
+
     # Esperar a que el editor esté listo
     for _ in range(10):
         has_editor = session.evaluate("!!document.querySelector('[contenteditable=\"true\"]')")

@@ -170,15 +170,24 @@ def cdp_evaluate_sync(expression: str, port: int = DEFAULT_DICLOAK_PORT, timeout
 # ── Profile Operations via CDP ───────────────────────────────────────────────
 
 def _ensure_on_profile_list(port: int = DEFAULT_DICLOAK_PORT) -> bool:
-    """Navega a la lista de perfiles si DICloak está en otra página."""
+    """Navega a la lista de perfiles y espera que la tabla cargue."""
+    import time as _t
+
     check_js = "location.hash.includes('envList') || location.hash.includes('environment')"
     result = cdp_evaluate_sync(check_js, port)
-    if result == "true":
-        return True
 
-    cdp_evaluate_sync("location.hash = '#/environment/envList'", port, timeout=5)
-    import time
-    time.sleep(2)
+    if result != "true":
+        cdp_evaluate_sync("location.hash = '#/environment/envList'", port, timeout=5)
+        _t.sleep(2)
+
+    # Esperar que la tabla tenga filas (hasta 5s)
+    for _ in range(10):
+        rows = cdp_evaluate_sync("document.querySelectorAll('.el-table__row').length", port, timeout=3)
+        if rows and int(rows or "0") > 0:
+            return True
+        _t.sleep(0.5)
+
+    log_warn("Tabla de perfiles vacia despues de navegar")
     return True
 
 
@@ -314,17 +323,31 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
     _ensure_on_profile_list(port)
     safe_name = profile_name.replace("'", "\\'").replace('"', '\\"')
 
-    # Paso 1: Scroll a la fila del perfil para que se renderice el boton
-    scroll_js = f"""(() => {{
-        const targetName = "{safe_name}".toLowerCase().trim();
-        const rows = document.querySelectorAll('.el-table__row');
+    # JS compartido: busca fila por palabras en TODAS las celdas
+    find_row_js = f"""
+        const targetWords = "{safe_name}".toLowerCase().trim().split(/\\s+/);
+        const rows = Array.from(document.querySelectorAll('.el-table__row'));
+        let targetRow = null;
+        let fallback = null;
         for (const row of rows) {{
             const cells = Array.from(row.querySelectorAll('td .cell'));
-            const nameCell = (cells[2]?.innerText || '').trim();
-            if (nameCell.toLowerCase() === targetName || nameCell.toLowerCase().includes(targetName) || targetName.includes(nameCell.toLowerCase())) {{
-                row.scrollIntoView({{block: 'center'}});
-                return 'SCROLLED: ' + nameCell;
-            }}
+            const rowText = cells.map(c => (c.innerText || '').trim().toLowerCase()).join(' ');
+            if (!targetWords.every(w => rowText.includes(w))) continue;
+            const btns = Array.from(row.querySelectorAll('button'));
+            const hasOpen = btns.some(b => /^(abrir|open|launch)$/i.test((b.innerText||'').trim()));
+            if (hasOpen) {{ targetRow = row; break; }}
+            if (!fallback) fallback = row;
+        }}
+        if (!targetRow) targetRow = fallback;
+    """
+
+    # Paso 1: Scroll
+    scroll_js = f"""(() => {{
+        {find_row_js}
+        if (targetRow) {{
+            targetRow.scrollIntoView({{block: 'center'}});
+            const cells = Array.from(targetRow.querySelectorAll('td .cell'));
+            return 'SCROLLED: ' + cells.map(c => (c.innerText||'').trim()).join(' | ').substring(0, 80);
         }}
         return 'NOT_FOUND';
     }})()"""
@@ -338,56 +361,25 @@ def open_profile_via_cdp(profile_name: str, port: int = DEFAULT_DICLOAK_PORT) ->
     import time as _time2
     _time2.sleep(1)
 
-    # Paso 2: Buscar boton y hacer click
+    # Paso 2: Click en boton
     open_js = f"""(() => {{
-        try {{
-            const targetName = "{safe_name}".toLowerCase().trim();
-            const rows = Array.from(document.querySelectorAll('.el-table__row'));
-            let targetRow = null;
+        {find_row_js}
+        if (!targetRow) return 'PROFILE_NOT_FOUND';
 
-            // Paso 1: match exacto (buscar en TODAS las celdas, no solo una posición fija)
-            for (const row of rows) {{
-                const cells = Array.from(row.querySelectorAll('td .cell'));
-                const match = cells.some(c => (c.innerText || '').trim().toLowerCase() === targetName);
-                if (match) {{ targetRow = row; break; }}
-            }}
+        const buttons = Array.from(targetRow.querySelectorAll('button, a, [role="button"], .el-button'));
+        const btnTexts = buttons.map(b => (b.innerText || b.textContent || '').trim().toLowerCase());
 
-            // Paso 2: match parcial — preferir filas que tengan boton "Abrir"
-            if (!targetRow) {{
-                let fallback = null;
-                for (const row of rows) {{
-                    const cells = Array.from(row.querySelectorAll('td .cell'));
-                    const texts = cells.map(c => (c.innerText || '').trim().toLowerCase());
-                    const match = texts.some(t => t.includes(targetName) || targetName.includes(t));
-                    if (match) {{
-                        const btns = Array.from(row.querySelectorAll('button'));
-                        const hasOpen = btns.some(b => /^(abrir|open|launch)$/i.test((b.innerText||'').trim()));
-                        if (hasOpen) {{ targetRow = row; break; }}
-                        if (!fallback) fallback = row;
-                    }}
-                }}
-                if (!targetRow) targetRow = fallback;
-            }}
+        const openIdx = btnTexts.findIndex(t => t === 'abrir' || t === 'open' || t === 'launch' || t === 'iniciar');
+        if (openIdx >= 0) {{ buttons[openIdx].click(); return 'CLICKED_OPEN'; }}
 
-            if (!targetRow) return 'PROFILE_NOT_FOUND';
+        const alreadyOpen = btnTexts.findIndex(t =>
+            t === 'ver' || t === 'view' ||
+            t === 'cerrar' || t === 'close' ||
+            t === 'abriendo' || t === 'abriendo...' || t === 'opening' || t === 'loading'
+        );
+        if (alreadyOpen >= 0) return 'ALREADY_OPEN';
 
-            const buttons = Array.from(targetRow.querySelectorAll('button, a, [role="button"], .el-button'));
-            const btnTexts = buttons.map(b => (b.innerText || b.textContent || '').trim().toLowerCase());
-
-            // 1. Boton "Abrir" — perfil cerrado, hay que abrirlo
-            const openIdx = btnTexts.findIndex(t => t === 'abrir' || t === 'open' || t === 'launch' || t === 'iniciar');
-            if (openIdx >= 0) {{ buttons[openIdx].click(); return 'CLICKED_OPEN'; }}
-
-            // 2. Perfil ya abierto — cualquier indicador (Ver, Cerrar, Abriendo, etc.)
-            const alreadyOpen = btnTexts.findIndex(t =>
-                t === 'ver' || t === 'view' ||
-                t === 'cerrar' || t === 'close' ||
-                t === 'abriendo' || t === 'abriendo...' || t === 'opening' || t === 'loading'
-            );
-            if (alreadyOpen >= 0) return 'ALREADY_OPEN';
-
-            return 'NO_OPEN_BUTTON: ' + btnTexts.join(', ');
-        }} catch(e) {{ return 'ERROR: ' + e.message; }}
+        return 'NO_OPEN_BUTTON: ' + btnTexts.join(', ');
     }})()"""
 
     result = str(cdp_evaluate_sync(open_js, port, timeout=5) or "")

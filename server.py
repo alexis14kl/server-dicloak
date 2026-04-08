@@ -459,7 +459,8 @@ def search_profile(name: str):
     try:
         profiles = service.get_profiles()
         target = name.lower().strip()
-        matches = [p for p in profiles if target in p["name"].lower() or p["name"].lower() in target]
+        target_words = target.split()
+        matches = [p for p in profiles if all(w in p["name"].lower() for w in target_words)]
         if matches:
             return success_response(
                 data={"count": len(matches), "profiles": matches},

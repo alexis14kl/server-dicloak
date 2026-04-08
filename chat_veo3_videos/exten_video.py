@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error
-from chat_veo3_videos.veo3_session import Veo3Session, _is_send_blocked, _switch_to_lower_priority
+from chat_veo3_videos.veo3_session import Veo3Session, _is_send_blocked, _switch_to_lower_priority, _ensure_video_lower_priority
 
 DEFAULT_VIDEO_DIR = Path(__file__).resolve().parent.parent / "output" / "videos"
 
@@ -663,7 +663,10 @@ def extend_video(port: int, prompt: str) -> dict:
             return {"success": False, "error": "No se encontro el campo de continuacion"}
         time.sleep(1)
 
-        log_info("[EXTENSION] Paso 4: Pegando prompt...")
+        log_info("[EXTENSION] Paso 4: Configurando modelo Lower Priority...")
+        _ensure_video_lower_priority(session)
+
+        log_info("[EXTENSION] Paso 5: Pegando prompt...")
         if not _paste_extend_prompt(session, prompt.strip()):
             return {"success": False, "error": "No se pudo pegar el prompt de extension"}
         time.sleep(3)
