@@ -495,6 +495,10 @@ def open_new_project(port: int, prompt: str = "") -> dict:
 
         title = session.evaluate("document.title") or ""
 
+        # Asegurar modo Video antes de pegar prompt
+        if not ensure_video_mode(session):
+            log_warn("No se pudo asegurar modo Video, intentando enviar de todas formas...")
+
         # Si hay prompt, pegarlo y enviarlo
         prompt_sent = False
         if prompt:
@@ -519,6 +523,164 @@ def open_new_project(port: int, prompt: str = "") -> dict:
 
     finally:
         session.close()
+
+
+def ensure_video_mode(session: Veo3Session) -> bool:
+    """Verifica que el selector de modelo esté en Video. Si está en Imagen, cambia.
+
+    Flujo:
+      1. Click en el chip del modelo (Nano Banana / Veo) → abre dropdown
+      2. Verificar aria-selected del tab Video
+      3. Si Imagen está seleccionado → click CDP real en tab Video
+      4. Cerrar dropdown clickeando fuera
+
+    Retorna True si ya estaba en Video o se cambió exitosamente.
+    """
+    # 1. Verificar estado actual sin abrir dropdown
+    current = session.evaluate("""(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of btns) {
+            if (!b.offsetParent) continue;
+            const text = (b.innerText || '').trim();
+            const rect = b.getBoundingClientRect();
+            // Chip del modelo: está en la parte inferior y contiene info del modelo
+            if (rect.top > window.innerHeight * 0.5 && rect.width > 80
+                && (text.includes('Nano Banana') || text.includes('nano banana')
+                    || text.includes('Veo') || text.includes('veo')
+                    || text.includes('x2') || text.includes('x1'))) {
+                return JSON.stringify({
+                    text: text.replace(/\\n/g, ' ').substring(0, 60),
+                    x: Math.round(rect.x + rect.width / 2),
+                    y: Math.round(rect.y + rect.height / 2),
+                });
+            }
+        }
+        return 'NO_SELECTOR';
+    })()""")
+
+    if not current or current == "NO_SELECTOR":
+        log_warn("[VIDEO_MODE] No se encontró selector de modelo")
+        return False
+
+    try:
+        chip = json.loads(current)
+    except Exception:
+        log_warn(f"[VIDEO_MODE] Error parseando selector: {current}")
+        return False
+
+    log_info(f"[VIDEO_MODE] Selector actual: {chip['text']}")
+
+    # 2. Abrir dropdown con CDP click real
+    session._send_raw("Input.dispatchMouseEvent", {
+        "type": "mouseMoved", "x": chip["x"], "y": chip["y"],
+    })
+    time.sleep(0.05)
+    session._send_raw("Input.dispatchMouseEvent", {
+        "type": "mousePressed", "x": chip["x"], "y": chip["y"],
+        "button": "left", "clickCount": 1,
+    })
+    time.sleep(0.05)
+    session._send_raw("Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": chip["x"], "y": chip["y"],
+        "button": "left", "clickCount": 1,
+    })
+    time.sleep(1.5)
+
+    # 3. Verificar si hay tab Video y su estado
+    tab_state = session.evaluate("""(() => {
+        const tabs = document.querySelectorAll('[role="tab"]');
+        let videoTab = null;
+        let imageSelected = false;
+        let videoSelected = false;
+
+        for (const t of tabs) {
+            const text = (t.innerText || '').trim().toLowerCase();
+            if (text.includes('imagen') || text.includes('image')) {
+                if (t.getAttribute('aria-selected') === 'true') imageSelected = true;
+            }
+            if (text.includes('deo') || text.includes('video')) {
+                videoSelected = t.getAttribute('aria-selected') === 'true';
+                if (!videoSelected) {
+                    const rect = t.getBoundingClientRect();
+                    videoTab = {x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2)};
+                }
+            }
+        }
+
+        if (videoSelected) return JSON.stringify({status: 'ALREADY_VIDEO'});
+        if (videoTab) return JSON.stringify({status: 'NEEDS_CLICK', ...videoTab});
+        return JSON.stringify({status: 'NO_TABS'});
+    })()""")
+
+    try:
+        state = json.loads(tab_state)
+    except Exception:
+        log_warn(f"[VIDEO_MODE] Error parseando tabs: {tab_state}")
+        return False
+
+    if state["status"] == "ALREADY_VIDEO":
+        log_ok("[VIDEO_MODE] Ya está en modo Video")
+        # Cerrar dropdown clickeando fuera
+        session._send_raw("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": 100, "y": 100,
+            "button": "left", "clickCount": 1,
+        })
+        session._send_raw("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": 100, "y": 100,
+            "button": "left", "clickCount": 1,
+        })
+        time.sleep(0.5)
+        return True
+
+    if state["status"] == "NO_TABS":
+        log_warn("[VIDEO_MODE] No se encontraron tabs Image/Video en el dropdown")
+        return False
+
+    # 4. Click CDP real en tab Video
+    log_info(f"[VIDEO_MODE] Clickeando tab Video en ({state['x']}, {state['y']})...")
+    session._send_raw("Input.dispatchMouseEvent", {
+        "type": "mouseMoved", "x": state["x"], "y": state["y"],
+    })
+    time.sleep(0.05)
+    session._send_raw("Input.dispatchMouseEvent", {
+        "type": "mousePressed", "x": state["x"], "y": state["y"],
+        "button": "left", "clickCount": 1,
+    })
+    time.sleep(0.05)
+    session._send_raw("Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": state["x"], "y": state["y"],
+        "button": "left", "clickCount": 1,
+    })
+    time.sleep(1)
+
+    # 5. Verificar que cambió
+    verify = session.evaluate("""(() => {
+        const tabs = document.querySelectorAll('[role="tab"]');
+        for (const t of tabs) {
+            const text = (t.innerText || '').trim().toLowerCase();
+            if ((text.includes('deo') || text.includes('video'))
+                && t.getAttribute('aria-selected') === 'true')
+                return 'VIDEO_OK';
+        }
+        return 'NOT_VIDEO';
+    })()""")
+
+    if verify == "VIDEO_OK":
+        log_ok("[VIDEO_MODE] Cambiado a modo Video exitosamente")
+        # Cerrar dropdown
+        session._send_raw("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": 100, "y": 100,
+            "button": "left", "clickCount": 1,
+        })
+        session._send_raw("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": 100, "y": 100,
+            "button": "left", "clickCount": 1,
+        })
+        time.sleep(0.5)
+        return True
+
+    log_warn(f"[VIDEO_MODE] No se pudo cambiar a Video: {verify}")
+    return False
 
 
 def _is_send_blocked(session: Veo3Session) -> bool:
