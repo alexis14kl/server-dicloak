@@ -326,6 +326,10 @@ class CloseProfileRequest(BaseModel):
     name: str = ""
     id: str = ""
 
+class ChatGPTStabilizeRequest(BaseModel):
+    port: int
+    timeout: int = 30
+
 class PromptRequest(BaseModel):
     port: int
     prompt: str
@@ -423,6 +427,7 @@ def index():
             "POST /profiles/open",
             "POST /profiles/close",
             "POST /profiles/hook",
+            "POST /chatgpt/stabilize",
             "POST /chatgpt/prompt",
             "POST /chatgpt/download-image",
             "POST /veo3/stabilize",
@@ -513,6 +518,19 @@ def inject_hook():
         return error_response("No se pudo inyectar el hook CDP", 500)
     except ConnectionError as e:
         return error_response(str(e), 503)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+@app.post("/chatgpt/stabilize")
+def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
+    """Estabiliza ChatGPT: cierra tabs duplicadas, deja 1 sola lista para generar."""
+    try:
+        from chat_gpt_consulta.stabilize import stabilize_chatgpt
+        result = stabilize_chatgpt(port=req.port, timeout=req.timeout)
+        if result.get("success"):
+            return success_response(data=result, message=result.get("message", "ChatGPT estabilizado"))
+        return error_response(result.get("error", "Error estabilizando"), 500, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 

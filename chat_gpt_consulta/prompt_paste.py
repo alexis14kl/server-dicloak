@@ -462,12 +462,55 @@ class ChatGPTSession:
 
     # ── Rotación de cuentas ──────────────────────────────────────────────
 
+    def _cdp_click_at(self, x: float, y: float):
+        """Click real via CDP Input.dispatchMouseEvent — secuencia completa."""
+        # mouseMoved primero (hover) para que React registre el target
+        self._send_raw("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": x, "y": y,
+        })
+        time.sleep(0.05)
+        for event_type in ("mousePressed", "mouseReleased"):
+            self._send_raw("Input.dispatchMouseEvent", {
+                "type": event_type,
+                "x": x, "y": y,
+                "button": "left",
+                "clickCount": 1,
+            })
+            time.sleep(0.05)
+
+    def _js_full_click(self, selector: str) -> str | None:
+        """Click via JS con secuencia completa de PointerEvent + MouseEvent.
+        Radix UI (ChatGPT) necesita PointerEvents para abrir menús.
+        """
+        return self.evaluate(f"""(() => {{
+            const selectors = {json.dumps([selector] if selector else [
+                '[data-testid="accounts-profile-button"]',
+                '[data-testid="profile-button"]',
+                'button[aria-label*="Account"]',
+                'button[aria-label*="Cuenta"]',
+            ])};
+            for (const sel of selectors) {{
+                const el = document.querySelector(sel);
+                if (!el) continue;
+                const target = el.closest('button') || el;
+                const rect = target.getBoundingClientRect();
+                const opts = {{bubbles: true, cancelable: true, clientX: rect.x + rect.width/2, clientY: rect.y + rect.height/2}};
+                target.dispatchEvent(new PointerEvent('pointerdown', {{...opts, pointerId: 1, pointerType: 'mouse'}}));
+                target.dispatchEvent(new MouseEvent('mousedown', opts));
+                target.dispatchEvent(new PointerEvent('pointerup', {{...opts, pointerId: 1, pointerType: 'mouse'}}));
+                target.dispatchEvent(new MouseEvent('mouseup', opts));
+                target.dispatchEvent(new MouseEvent('click', opts));
+                return 'CLICKED:' + sel;
+            }}
+            return 'NO_BUTTON';
+        }})()""")
+
     def switch_account(self, exhausted_ids: set[str]) -> dict:
         """Abre menú de perfil, lista cuentas, click en una no agotada.
         Retorna dict con switched, account_id, account_label, available_count.
         """
-        # 1. Click en botón de perfil (múltiples selectores por si la UI cambió)
-        clicked = self.evaluate("""(() => {
+        # 1. Encontrar botón de perfil
+        btn_info = self.evaluate("""(() => {
             const selectors = [
                 '[data-testid="accounts-profile-button"]',
                 '[data-testid="profile-button"]',
@@ -481,35 +524,70 @@ class ChatGPTSession:
                 const btn = document.querySelector(sel);
                 if (btn) {
                     const target = btn.closest('button') || btn;
-                    target.click();
-                    return 'CLICKED:' + sel;
+                    const rect = target.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return JSON.stringify({
+                            x: rect.x + rect.width / 2,
+                            y: rect.y + rect.height / 2,
+                            sel: sel,
+                        });
+                    }
                 }
             }
             return 'NO_BUTTON';
         })()""")
-        if not clicked or not clicked.startswith("CLICKED"):
+
+        if not btn_info or btn_info == "NO_BUTTON":
             log_warn("No se encontró botón de perfil")
             return {"switched": False, "reason": "no_profile_button"}
-        log_info(f"Botón de perfil clickeado: {clicked}")
 
-        time.sleep(2)
+        try:
+            pos = json.loads(btn_info)
+        except Exception:
+            log_warn(f"Error parseando posición del botón: {btn_info}")
+            return {"switched": False, "reason": "btn_parse_error"}
 
-        # 2. Esperar menú (múltiples intentos)
+        sel = pos.get("sel", "")
+        log_info(f"Botón de perfil encontrado: {sel} en ({pos['x']:.0f}, {pos['y']:.0f})")
+
+        # 2. Intentar abrir menú con 3 estrategias distintas
         menu_found = False
-        for _try in range(3):
-            menu_ready = self.evaluate("""(() => {
-                const menu = document.querySelector('[role="menu"]')
-                    || document.querySelector('[data-radix-menu-content]')
-                    || document.querySelector('[role="listbox"]');
-                return menu ? 'YES' : 'NO';
-            })()""")
-            if menu_ready == "YES":
-                menu_found = True
+        strategies = [
+            ("PointerEvent JS (Radix)", lambda: self._js_full_click(sel)),
+            ("CDP dispatchMouseEvent", lambda: self._cdp_click_at(pos["x"], pos["y"])),
+            ("focus + Enter key", lambda: self.evaluate(f"""(() => {{
+                const btn = document.querySelector('{sel}');
+                if (btn) {{ (btn.closest('button') || btn).focus(); }}
+            }})()""") or self._send_raw("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "Enter", "code": "Enter",
+                "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+            })),
+        ]
+
+        for name, action in strategies:
+            log_info(f"Intentando abrir menú: {name}")
+            action()
+            time.sleep(1.5)
+
+            # Verificar si el menú apareció
+            for _check in range(5):
+                menu_ready = self.evaluate("""(() => {
+                    const menu = document.querySelector('[role="menu"]')
+                        || document.querySelector('[data-radix-menu-content]')
+                        || document.querySelector('[role="listbox"]');
+                    return menu ? 'YES' : 'NO';
+                })()""")
+                if menu_ready == "YES":
+                    menu_found = True
+                    break
+                time.sleep(0.7)
+
+            if menu_found:
+                log_ok(f"Menú abierto con: {name}")
                 break
-            time.sleep(1)
 
         if not menu_found:
-            log_warn("Menú de perfil no apareció")
+            log_warn("Menú de perfil no apareció con ninguna estrategia")
             return {"switched": False, "reason": "menu_not_found"}
 
         # 3. Listar cuentas
@@ -552,31 +630,55 @@ class ChatGPTSession:
             log_warn(f"Sin cuentas disponibles (total disponibles: {available_count})")
             return {"switched": False, "available_count": available_count, "reason": "no_candidates"}
 
-        # 4. Click en primera candidata
+        # 4. Click en primera candidata via CDP (evento real)
         chosen = candidates[0]
         chosen_idx = chosen["index"]
         log_info(f"Cambiando a cuenta: {chosen['label']} (index={chosen_idx})")
 
+        # Click en cuenta via PointerEvent (Radix) — causa navegación inmediata.
+        # El WebSocket se rompe — eso es ESPERADO, no es un error.
         self.evaluate(f"""(() => {{
             const items = document.querySelectorAll('[role="menuitemradio"]');
-            if (items[{chosen_idx}]) items[{chosen_idx}].click();
+            const el = items[{chosen_idx}];
+            if (!el) return;
+            const rect = el.getBoundingClientRect();
+            const opts = {{bubbles: true, cancelable: true, clientX: rect.x + rect.width/2, clientY: rect.y + rect.height/2}};
+            el.dispatchEvent(new PointerEvent('pointerdown', {{...opts, pointerId: 1, pointerType: 'mouse'}}));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', {{...opts, pointerId: 1, pointerType: 'mouse'}}));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
         }})()""")
 
-        # 5. Esperar recarga (cambio de cuenta causa navegación)
-        time.sleep(5)
+        # 5. Esperar a que la página termine de navegar
+        time.sleep(6)
 
-        # 6. Reconectar WebSocket
+        # 6. Reconectar: LIMPIAR ws_url para forzar búsqueda fresca del target
         self._ws = None
-        self.connect()
+        self.ws_url = ""  # <-- CLAVE: forzar _find_chatgpt_target() en vez de reusar URL viejo
+        for _retry in range(5):
+            if self.connect():
+                break
+            log_info(f"Reconexión intento {_retry + 1}/5...")
+            time.sleep(3)
+        else:
+            log_warn("No se pudo reconectar tras cambio de cuenta")
+            return {"switched": False, "reason": "reconnect_failed", "available_count": available_count}
 
         # 7. Navegar a chat limpio
         self.evaluate("window.location.href = 'https://chatgpt.com/'")
-        time.sleep(4)
+        time.sleep(5)
+
+        # Reconectar de nuevo (la navegación rompe el WS otra vez)
         self._ws = None
-        self.connect()
+        self.ws_url = ""
+        for _retry in range(5):
+            if self.connect():
+                break
+            time.sleep(3)
 
         # 8. Esperar editor ready
-        self.wait_for_page_ready(timeout_sec=15)
+        self.wait_for_page_ready(timeout_sec=30)
 
         log_ok(f"Cuenta cambiada a: {chosen['label']}")
         return {
