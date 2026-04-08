@@ -192,119 +192,181 @@ def _check_image_state(session: ChatGPTSession, anchor: dict | None = None) -> d
         return {"status": "WAITING"}
 
 
-# Cantidad de checks consecutivos con la misma URL para considerar estable.
+# Checks consecutivos con la misma URL para considerar estable.
 # DALL-E sirve primero una versión intermedia y luego la final en la misma URL.
-# Necesitamos suficientes checks para que la versión final se estabilice.
-_STABLE_CHECKS_REQUIRED = 5
-_STABLE_CHECK_INTERVAL = 3  # segundos entre cada check de estabilidad
+_STABLE_CHECKS_REQUIRED = 3
+_STABLE_CHECK_INTERVAL = 6  # segundos entre cada check de estabilidad (3 * 6s = 18s max)
+
+
+def _wait_for_generation_end(session: ChatGPTSession, timeout_sec: int) -> str:
+    """Espera sin polling usando MutationObserver a que ChatGPT termine de generar.
+
+    Retorna: 'done', 'rate_limited', 'no_tokens', 'timeout'.
+    Un solo CDP evaluate bloqueante — cero polls durante la generación.
+    """
+    timeout_ms = timeout_sec * 1000
+    result = session.evaluate(f"""
+    new Promise((resolve) => {{
+        const TIMEOUT = {timeout_ms};
+
+        const ratePhrases = [
+            'demasiadas solicitudes', 'too many requests', 'rate limit',
+            'limitado temporalmente', "you've been temporarily restricted",
+        ];
+        const tokenPhrases = [
+            'has alcanzado tu limite', 'hit the team plan limit', 'hit the plan limit',
+            'youve hit', 'the limit resets in', "you've reached your limit",
+            'image generation limit', 'cannot generate more images',
+        ];
+
+        function checkErrors() {{
+            const text = (document.body?.innerText || '').toLowerCase()
+                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+            if (ratePhrases.some(p => text.includes(p))) return 'RATE_LIMITED';
+            if (tokenPhrases.some(p => text.includes(p))) return 'NO_TOKENS';
+            return null;
+        }}
+
+        function isGenerating() {{
+            return !!(
+                document.querySelector('button[data-testid="stop-button"]')
+                || document.querySelector('button[aria-label="Stop generating"]')
+                || document.querySelector('button[aria-label="Detener la generación"]')
+                || document.querySelector('[role="progressbar"]')
+            );
+        }}
+
+        // Si ya hay error visible, retornar inmediatamente
+        const immediate = checkErrors();
+        if (immediate) {{ resolve(immediate); return; }}
+
+        // Si ya terminó de generar, retornar inmediatamente
+        if (!isGenerating()) {{ resolve('DONE'); return; }}
+
+        let observer = null;
+        let timer = null;
+
+        function cleanup() {{
+            if (observer) observer.disconnect();
+            if (timer) clearTimeout(timer);
+        }}
+
+        function done(status) {{ cleanup(); resolve(status); }}
+
+        observer = new MutationObserver(() => {{
+            const err = checkErrors();
+            if (err) {{ done(err); return; }}
+            if (!isGenerating()) {{
+                // Esperar 1s para que el DOM se estabilice
+                setTimeout(() => {{
+                    const err2 = checkErrors();
+                    done(err2 || 'DONE');
+                }}, 1000);
+            }}
+        }});
+
+        observer.observe(document.body, {{
+            childList: true, subtree: true, attributes: true,
+            attributeFilter: ['data-testid', 'aria-label', 'role'],
+        }});
+
+        timer = setTimeout(() => {{
+            done(checkErrors() || 'TIMEOUT');
+        }}, TIMEOUT);
+    }})
+    """, timeout=timeout_sec + 15, await_promise=True)
+
+    status = str(result or "TIMEOUT").strip()
+    return status.lower() if status in ("DONE", "RATE_LIMITED", "NO_TOKENS", "TIMEOUT") else "done"
 
 
 def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300, anchor: dict | None = None) -> str:
     """Espera que ChatGPT genere la imagen y retorna la URL final estable.
 
-    La imagen de ChatGPT pasa por varias fases:
-      1. GENERATING — el stop button está visible
-      2. LOADING — la imagen aparece pero aún carga (baja resolución / progresiva)
-      3. READY — img.complete=true y naturalWidth > 512
-
-    Después de READY, esperamos que la URL sea estable (no cambie) durante
-    varios checks consecutivos, para asegurar que es la versión final
-    y no un preview intermedio.
+    Fase 1 — MutationObserver (cero polls): espera sin polling a que ChatGPT
+              termine de generar. Un único CDP evaluate bloqueante.
+    Fase 2 — Polling mínimo: solo para verificar que la URL de imagen es estable
+              (DALL-E sirve la misma URL de forma progresiva: primero preview,
+              luego versión final). Máximo _STABLE_CHECKS_REQUIRED polls.
     """
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
 
-    # Verificación inicial: esperar hasta 30s a que aparezca actividad
-    # (ChatGPT puede tardar en empezar a generar o ya haber terminado)
-    initial_deadline = time.time() + 30
-    while time.time() < initial_deadline:
-        initial = _check_image_state(session, anchor=anchor)
-        initial_status = initial.get("status", "")
-        if initial_status in ("GENERATING", "LOADING", "READY", "COMPARISON_RESOLVED"):
-            log_info(f"Actividad detectada: {initial_status}")
-            break
-        if session._check_rate_limited():
-            session.last_error = "rate_limited"
-            session._dismiss_rate_limit_modal()
-            log_warn("Rate limit detectado antes de iniciar la generación de imagen")
-            return ""
-        if session._check_no_tokens():
-            log_warn("Tokens agotados — no hay imagen que esperar")
-            return ""
-        time.sleep(2)
-    else:
-        log_warn("Sin actividad de imagen en 30s. Continuando espera por si acaso...")
-        # No abortar — seguir al loop principal por si la imagen aparece tarde
+    # ── Fase 1: MutationObserver — espera sin polling ────────────────────────
+    remaining = max(20, int(deadline - time.time()))
+    gen_status = _wait_for_generation_end(session, timeout_sec=remaining)
 
+    if gen_status == "rate_limited":
+        session.last_error = "rate_limited"
+        session._dismiss_rate_limit_modal()
+        log_warn("Rate limit detectado durante generación de imagen")
+        return ""
+
+    if gen_status == "no_tokens":
+        log_warn("Tokens agotados — no hay imagen que esperar")
+        return ""
+
+    if gen_status == "timeout":
+        log_warn("Timeout esperando que ChatGPT termine la generación")
+        return ""
+
+    log_ok("ChatGPT terminó de generar — buscando URL de imagen...")
+
+    # ── Fase 2: Polling mínimo — estabilidad de URL ──────────────────────────
     stable_url = ""
     stable_count = 0
-    token_check_counter = 0
 
     while time.time() < deadline:
-        # Cada 5 ciclos, verificar si ChatGPT respondió con error de tokens
-        # en vez de generar una imagen (evita esperar 300s en vano)
-        token_check_counter += 1
-        if token_check_counter % 5 == 0:
-            if session._check_rate_limited():
-                session.last_error = "rate_limited"
-                session._dismiss_rate_limit_modal()
-                log_warn("Rate limit detectado durante espera de imagen")
-                return ""
-            if session._check_no_tokens():
-                log_warn("Tokens agotados detectados durante espera de imagen")
-                return ""
-
         info = _check_image_state(session, anchor=anchor)
         status = info.get("status", "")
-
-        if status == "GENERATING":
-            stable_url, stable_count = "", 0
-            time.sleep(2)
-            continue
 
         if status == "COMPARISON_RESOLVED":
             log_info("Comparación de imágenes resuelta, esperando URL...")
             stable_url, stable_count = "", 0
-            time.sleep(2)
+            time.sleep(4)
             continue
 
         if status == "LOADING":
             w = info.get("width", 0)
-            log_info(f"Imagen cargando (width={w}, complete={info.get('complete')}). Esperando...")
+            log_info(f"Imagen cargando (width={w}). Esperando...")
             stable_url, stable_count = "", 0
-            time.sleep(3)
+            time.sleep(8)
             continue
 
         if status == "READY":
             url = info.get("url", "")
             w = info.get("width", 0)
-
             if url == stable_url:
                 stable_count += 1
             else:
-                # URL cambió — reiniciar contador de estabilidad
                 stable_url = url
                 stable_count = 1
-                log_info(f"Imagen detectada (width={w}). Verificando estabilidad...")
+                log_info(f"Imagen detectada (width={w}). Verificando estabilidad ({stable_count}/{_STABLE_CHECKS_REQUIRED})...")
 
             if stable_count >= _STABLE_CHECKS_REQUIRED:
                 log_ok(f"Imagen final estable: width={w}px ({stable_count} checks)")
                 return url
 
+            log_info(f"Check de estabilidad {stable_count}/{_STABLE_CHECKS_REQUIRED}...")
             time.sleep(_STABLE_CHECK_INTERVAL)
             continue
 
-        # WAITING — no hay imagen aún, chequear tokens más frecuente
-        stable_url, stable_count = "", 0
+        if status == "GENERATING":
+            # Aún generando después del MutationObserver — esperar más
+            log_info("Aún generando, esperando...")
+            time.sleep(3)
+            continue
+
+        # WAITING — imagen aún no apareció tras terminar la generación
         if session._check_rate_limited():
             session.last_error = "rate_limited"
             session._dismiss_rate_limit_modal()
-            log_warn("Rate limit detectado mientras ChatGPT seguía en espera")
+            log_warn("Rate limit detectado tras generación")
             return ""
         if session._check_no_tokens():
-            log_warn("Tokens agotados detectados durante espera de imagen")
+            log_warn("Tokens agotados detectados tras generación")
             return ""
-        time.sleep(2)
+        time.sleep(5)
 
     log_warn("Timeout esperando imagen")
     return ""
