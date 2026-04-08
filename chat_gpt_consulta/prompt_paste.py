@@ -132,7 +132,7 @@ class ChatGPTSession:
             last_ws = ""
             for t in targets:
                 url = (t.get("url") or "").lower()
-                if "chatgpt.com" in url and t.get("type") == "page":
+                if t.get("type") == "page" and "://chatgpt.com" in url:
                     last_ws = t.get("webSocketDebuggerUrl", "")
             if last_ws:
                 return last_ws
@@ -1007,8 +1007,8 @@ class ChatGPTSession:
 
         # 8. Verificar si ya está en chatgpt.com (el cambio de cuenta navega solo)
         #    Solo forzar navegación si NO está en chatgpt.com
-        current_url = self.evaluate("window.location.href") or ""
-        if "chatgpt.com" not in current_url.lower():
+        current_url = (self.evaluate("window.location.href") or "").lower()
+        if "://chatgpt.com" not in current_url:
             log_info("Post-switch: no en ChatGPT, navegando...")
             self.evaluate("window.location.href = 'https://chatgpt.com/'")
             time.sleep(5)

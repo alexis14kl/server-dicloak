@@ -71,7 +71,7 @@ def stabilize_chatgpt(port: int, timeout: int = 30, keep_target_id: str = "") ->
     other_tabs = []
     for t in targets:
         url = (t.get("url") or "").lower()
-        if t.get("type") == "page" and "chatgpt.com" in url:
+        if t.get("type") == "page" and "://chatgpt.com" in url:
             chatgpt_tabs.append(t)
         elif t.get("type") == "page":
             other_tabs.append(t)
@@ -194,10 +194,9 @@ def stabilize_chatgpt(port: int, timeout: int = 30, keep_target_id: str = "") ->
                 except Exception:
                     current_url = ""
 
-                if "chatgpt.com" not in current_url.lower():
-                    # Solo navegar si no está en ChatGPT
+                if "://chatgpt.com" not in current_url.lower():
                     page_cdp("Page.navigate", {"url": "https://chatgpt.com/"})
-                    log_info("Tab no estaba en ChatGPT, navegando...")
+                    log_info(f"Tab no estaba en ChatGPT ({current_url[:40]}), navegando...")
                     time.sleep(3)
                 else:
                     log_info(f"Tab ya en ChatGPT: {current_url[:60]}")

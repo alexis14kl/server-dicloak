@@ -120,8 +120,16 @@ def _list_chatgpt_targets(port: int) -> list[dict]:
         return []
     return [
         t for t in targets
-        if t.get("type") == "page" and "chatgpt.com" in (t.get("url") or "").lower()
+        if t.get("type") == "page" and _is_chatgpt_url((t.get("url") or ""))
     ]
+
+
+def _is_chatgpt_url(url: str) -> bool:
+    """Verifica si una URL es del chat principal de ChatGPT.
+    Solo acepta https://chatgpt.com/... — rechaza cualquier subdominio.
+    """
+    u = url.lower().strip()
+    return "://chatgpt.com" in u or u.startswith("chatgpt.com")
 
 
 def _inspect_chatgpt_tab(ws_url: str) -> dict:
