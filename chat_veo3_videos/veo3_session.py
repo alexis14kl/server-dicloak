@@ -495,6 +495,26 @@ def open_new_project(port: int, prompt: str = "") -> dict:
 
         title = session.evaluate("document.title") or ""
 
+        # Esperar a que el selector de modelo aparezca (tarda unos segundos)
+        log_info("Esperando selector de modelo...")
+        for _wait in range(8):
+            selector_check = session.evaluate("""(() => {
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                for (const b of btns) {
+                    if (!b.offsetParent) continue;
+                    const text = (b.innerText || '').trim().toLowerCase();
+                    const rect = b.getBoundingClientRect();
+                    if (rect.top > window.innerHeight * 0.5 && rect.width > 80
+                        && (text.includes('nano') || text.includes('banana')
+                            || text.includes('veo') || text.includes('x2') || text.includes('x1')))
+                        return 'FOUND';
+                }
+                return 'NOT_YET';
+            })()""")
+            if selector_check == "FOUND":
+                break
+            time.sleep(1)
+
         # Asegurar modo Video antes de pegar prompt
         if not ensure_video_mode(session):
             log_warn("No se pudo asegurar modo Video, intentando enviar de todas formas...")
