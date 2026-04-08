@@ -21,6 +21,13 @@ from chat_gpt_consulta.account_state import (
     get_exhausted_ids, mark_exhausted, clear_exhausted,
 )
 
+_MIN_SEND_INTERVAL_SEC = max(0, int(os.environ.get("CHATGPT_MIN_SEND_INTERVAL_SEC", "12")))
+_RATE_LIMIT_COOLDOWN_SEC = max(
+    _MIN_SEND_INTERVAL_SEC,
+    int(os.environ.get("CHATGPT_RATE_LIMIT_COOLDOWN_SEC", "180")),
+)
+_LAST_SEND_BY_PORT: dict[int, float] = {}
+
 
 @dataclass
 class ChatGPTSession:
@@ -29,6 +36,7 @@ class ChatGPTSession:
     ws_url: str = ""
     _ws: object = field(default=None, repr=False)
     _msg_id: int = field(default=0, repr=False)
+    last_error: str = field(default="", repr=False)
 
     def connect(self) -> bool:
         """Conecta al CDP del navegador de ChatGPT.
@@ -176,10 +184,34 @@ class ChatGPTSession:
         })()""")
         return result == "YES"
 
+    def _dismiss_rate_limit_modal(self) -> None:
+        """Cierra el modal de rate limit si está visible."""
+        self.evaluate("""(() => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            const ok = btns.find(b => /entendido|understood|ok|got it/i.test(b.innerText));
+            if (ok) ok.click();
+        })()""")
+
+    def _mark_rate_limited(self) -> None:
+        self.last_error = "rate_limited"
+
+    def _respect_send_pacing(self) -> None:
+        """Impone una pausa mínima entre envíos por perfil/CDP."""
+        if _MIN_SEND_INTERVAL_SEC <= 0:
+            return
+        now = time.time()
+        last_send = _LAST_SEND_BY_PORT.get(self.port, 0.0)
+        remaining = (last_send + _MIN_SEND_INTERVAL_SEC) - now
+        if remaining > 0:
+            wait_for = round(remaining, 1)
+            log_info(f"Pacing anti-rate-limit: esperando {wait_for}s antes de enviar...")
+            time.sleep(remaining)
+
     # ── Acciones de ChatGPT ──────────────────────────────────────────────
 
     def wait_for_page_ready(self, timeout_sec: int = 60) -> bool:
         """Espera que ChatGPT cargue completamente (sin CAPTCHA)."""
+        self.last_error = ""
         deadline = time.time() + timeout_sec
         consecutive_fails = 0
         while time.time() < deadline:
@@ -210,16 +242,12 @@ class ChatGPTSession:
                 time.sleep(1)
                 continue
 
-            # Detectar modal de rate limit y cerrarlo
+            # Detectar modal de rate limit y abortar para no insistir
             if self._check_rate_limited():
-                log_warn("Rate limit detectado en page_ready — cerrando modal y esperando 30s...")
-                self.evaluate("""(() => {
-                    const btns = Array.from(document.querySelectorAll('button'));
-                    const ok = btns.find(b => /entendido|understood|ok|got it/i.test(b.innerText));
-                    if (ok) ok.click();
-                })()""")
-                time.sleep(30)
-                continue
+                self._mark_rate_limited()
+                self._dismiss_rate_limit_modal()
+                log_warn("Rate limit detectado en page_ready — abortando para evitar más envíos")
+                return False
 
             # Verificar que el editor esté listo
             ready = self.evaluate("""(() => {
@@ -311,6 +339,16 @@ class ChatGPTSession:
 
     def send_prompt(self) -> bool:
         """Hace click en el botón de enviar."""
+        self.last_error = ""
+
+        if self._check_rate_limited():
+            self._mark_rate_limited()
+            self._dismiss_rate_limit_modal()
+            log_warn("Rate limit detectado antes de enviar")
+            return False
+
+        self._respect_send_pacing()
+
         result = self.evaluate("""(() => {
             // Buscar botón send
             const btn = document.querySelector('button[data-testid="send-button"]')
@@ -323,25 +361,29 @@ class ChatGPTSession:
             return 'NO_BUTTON';
         })()""")
 
-        if result and "CLICKED" in str(result):
-            log_ok("Prompt enviado")
-            return True
+        if result and "CLICKED" not in str(result):
+            # Fallback: Enter via CDP
+            log_info("Botón no encontrado, intentando Enter...")
+            self.evaluate("""(() => {
+                const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
+                if (editor) editor.focus();
+            })()""")
+            self._send_raw("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "Enter", "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+            })
+            self._send_raw("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "Enter", "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+            })
 
-        # Fallback: Enter via CDP
-        log_info("Botón no encontrado, intentando Enter...")
-        self.evaluate("""(() => {
-            const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
-            if (editor) editor.focus();
-        })()""")
-        self._send_raw("Input.dispatchKeyEvent", {
-            "type": "keyDown", "key": "Enter", "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-        })
-        self._send_raw("Input.dispatchKeyEvent", {
-            "type": "keyUp", "key": "Enter", "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-        })
         time.sleep(2)
+
+        if self._check_rate_limited():
+            self._mark_rate_limited()
+            self._dismiss_rate_limit_modal()
+            log_warn("Rate limit detectado justo después de enviar")
+            return False
 
         # Verificar que el editor se vació (prompt enviado)
         text_after = self.evaluate("""(() => {
@@ -350,6 +392,7 @@ class ChatGPTSession:
         })()""") or ""
 
         if len(text_after) < 5:
+            _LAST_SEND_BY_PORT[self.port] = time.time()
             log_ok("Prompt enviado via Enter")
             return True
 
@@ -408,14 +451,9 @@ class ChatGPTSession:
         idle_cycles = 0
         while time.time() < deadline:
             if self._check_rate_limited():
-                log_warn("Rate limit detectado — esperando 60s antes de continuar...")
-                # Click en "Entendido" si existe
-                self.evaluate("""(() => {
-                    const btns = Array.from(document.querySelectorAll('button'));
-                    const ok = btns.find(b => /entendido|understood|ok|got it/i.test(b.innerText));
-                    if (ok) ok.click();
-                })()""")
-                time.sleep(60)
+                self._mark_rate_limited()
+                self._dismiss_rate_limit_modal()
+                log_warn("Rate limit detectado durante generación")
                 return "rate_limited"
 
             if self._check_no_tokens():
@@ -784,6 +822,8 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True,
     try:
         # Esperar que la página esté lista
         if not session.wait_for_page_ready(timeout_sec=30):
+            if session.last_error == "rate_limited":
+                return _rate_limited_result(session)
             return {"success": False, "error": "ChatGPT no cargó completamente"}
 
         # Pegar prompt
@@ -792,6 +832,8 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True,
 
         # Enviar
         if not session.send_prompt():
+            if session.last_error == "rate_limited":
+                return _rate_limited_result(session)
             return {"success": False, "error": "No se pudo enviar el prompt"}
 
         result = {
@@ -841,10 +883,17 @@ def paste_prompt_only(port: int, prompt: str, target_ws: str = "") -> dict:
 
     try:
         if not session.wait_for_page_ready(timeout_sec=30):
+            if session.last_error == "rate_limited":
+                return _rate_limited_result(session)
             return {"success": False, "error": "ChatGPT no cargó completamente"}
 
         if not session.paste_prompt(prompt):
             return {"success": False, "error": "No se pudo pegar el prompt"}
+
+        if session._check_rate_limited():
+            session._mark_rate_limited()
+            session._dismiss_rate_limit_modal()
+            return _rate_limited_result(session)
 
         return {
             "success": True,
@@ -887,6 +936,8 @@ def send_pasted_prompt(
 
     try:
         if not session.wait_for_page_ready(timeout_sec=30):
+            if session.last_error == "rate_limited":
+                return _rate_limited_result(session)
             return {"success": False, "error": "ChatGPT no cargó completamente"}
 
         editor_text = session.evaluate("""(() => {
@@ -902,6 +953,8 @@ def send_pasted_prompt(
             }
 
         if not session.send_prompt():
+            if session.last_error == "rate_limited":
+                return _rate_limited_result(session)
             return {"success": False, "error": "No se pudo enviar el prompt"}
 
         result = {
@@ -927,6 +980,18 @@ def send_pasted_prompt(
 
 
 MAX_ROTATION_ATTEMPTS = 5
+
+
+def _rate_limited_result(session: ChatGPTSession, rotations: int = 0) -> dict:
+    """Respuesta estándar cuando ChatGPT activa el rate limit temporal."""
+    return {
+        "success": False,
+        "error": "rate_limited",
+        "message": "ChatGPT limitó temporalmente el acceso a conversaciones",
+        "cooldown_sec": _RATE_LIMIT_COOLDOWN_SEC,
+        "rotations": rotations,
+        "target_ws": session.ws_url,
+    }
 
 
 def paste_and_send_with_rotation(
@@ -966,6 +1031,8 @@ def paste_and_send_with_rotation(
 
             # Esperar página lista (60s para dar tiempo a que cargue)
             if not session.wait_for_page_ready(timeout_sec=60):
+                if session.last_error == "rate_limited":
+                    return _rate_limited_result(session, rotations=rotations)
                 return {"success": False, "error": "ChatGPT no cargó completamente"}
 
             # Pegar prompt
@@ -974,6 +1041,8 @@ def paste_and_send_with_rotation(
 
             # Enviar
             if not session.send_prompt():
+                if session.last_error == "rate_limited":
+                    return _rate_limited_result(session, rotations=rotations)
                 return {"success": False, "error": "No se pudo enviar el prompt"}
 
             # Detectar estado de tokens
@@ -1006,10 +1075,7 @@ def paste_and_send_with_rotation(
                 }
 
             if status == "rate_limited":
-                # NO rotar — backoff y reintentar en la misma cuenta
-                log_warn("Rate limit detectado. Esperando 60s y reintentando...")
-                time.sleep(60)
-                continue
+                return _rate_limited_result(session, rotations=rotations)
 
             # no_image_tokens → marcar cuenta y rotar
             if last_account_id:

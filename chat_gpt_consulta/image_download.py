@@ -140,6 +140,11 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
         if initial_status in ("GENERATING", "LOADING", "READY", "COMPARISON_RESOLVED"):
             log_info(f"Actividad detectada: {initial_status}")
             break
+        if session._check_rate_limited():
+            session.last_error = "rate_limited"
+            session._dismiss_rate_limit_modal()
+            log_warn("Rate limit detectado antes de iniciar la generación de imagen")
+            return ""
         if session._check_no_tokens():
             log_warn("Tokens agotados — no hay imagen que esperar")
             return ""
@@ -157,6 +162,11 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
         # en vez de generar una imagen (evita esperar 300s en vano)
         token_check_counter += 1
         if token_check_counter % 5 == 0:
+            if session._check_rate_limited():
+                session.last_error = "rate_limited"
+                session._dismiss_rate_limit_modal()
+                log_warn("Rate limit detectado durante espera de imagen")
+                return ""
             if session._check_no_tokens():
                 log_warn("Tokens agotados detectados durante espera de imagen")
                 return ""
@@ -203,6 +213,11 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
 
         # WAITING — no hay imagen aún, chequear tokens más frecuente
         stable_url, stable_count = "", 0
+        if session._check_rate_limited():
+            session.last_error = "rate_limited"
+            session._dismiss_rate_limit_modal()
+            log_warn("Rate limit detectado mientras ChatGPT seguía en espera")
+            return ""
         if session._check_no_tokens():
             log_warn("Tokens agotados detectados durante espera de imagen")
             return ""
@@ -336,6 +351,12 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
 
         log_info(f"Descargando imagen (intento {attempt + 1}/8)...")
 
+        if session._check_rate_limited():
+            session.last_error = "rate_limited"
+            session._dismiss_rate_limit_modal()
+            log_warn("Rate limit detectado antes de descargar la imagen")
+            return ""
+
         # Re-obtener cookies si no las tenemos
         if not cookies:
             cookies = _get_cookies_via_cdp(session)
@@ -402,6 +423,12 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
         image_url = wait_for_image(session, timeout_sec=timeout)
         if not image_url:
             # Determinar si fue por tokens agotados o timeout genérico
+            if session.last_error == "rate_limited" or session._check_rate_limited():
+                return {
+                    "success": False,
+                    "error": "rate_limited",
+                    "message": "ChatGPT limitó temporalmente el acceso a conversaciones",
+                }
             if session._check_no_tokens():
                 return {
                     "success": False,

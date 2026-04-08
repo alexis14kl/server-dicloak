@@ -596,7 +596,8 @@ def chatgpt_prompt(req: PromptRequest):
         if result.get("success"):
             message = "Prompt pegado en ChatGPT" if req.paste_only else "Prompt enviado a ChatGPT"
             return success_response(data=result, message=message)
-        return error_response(result.get("error", "Error desconocido"), 500, details=result)
+        status_code = 429 if result.get("error") == "rate_limited" else 500
+        return error_response(result.get("error", "Error desconocido"), status_code, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 
@@ -613,7 +614,8 @@ def chatgpt_send_pasted(req: SendPastedPromptRequest):
         )
         if result.get("success"):
             return success_response(data=result, message="Prompt pegado enviado a ChatGPT")
-        return error_response(result.get("error", "Error desconocido"), 500, details=result)
+        status_code = 429 if result.get("error") == "rate_limited" else 500
+        return error_response(result.get("error", "Error desconocido"), status_code, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 
@@ -677,7 +679,8 @@ def chatgpt_download_image(req: ImageDownloadRequest):
                 result["image_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/images/{file_name}"
             _notify_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Imagen descargada")
-        return error_response(result.get("error", "Error desconocido"), 500, details=result)
+        status_code = 429 if result.get("error") == "rate_limited" else 500
+        return error_response(result.get("error", "Error desconocido"), status_code, details=result)
     except Exception as e:
         return error_response(str(e), 500)
 
