@@ -27,6 +27,63 @@ _RATE_LIMIT_COOLDOWN_SEC = max(
     int(os.environ.get("CHATGPT_RATE_LIMIT_COOLDOWN_SEC", "180")),
 )
 _LAST_SEND_BY_PORT: dict[int, float] = {}
+_IMAGE_ANCHORS_BY_WS: dict[str, dict] = {}
+
+
+def _capture_image_generation_anchor(session: "ChatGPTSession") -> dict:
+    """Captura el estado base del chat antes de generar una nueva imagen.
+
+    Sirve para ignorar imágenes previas cuando reutilizamos la misma conversación.
+    """
+    result = session.evaluate("""(() => {
+        const turns = Array.from(document.querySelectorAll(
+            '[data-testid^="conversation-turn"][data-turn="assistant"], section[data-turn="assistant"]'
+        ));
+        const turnIds = turns.map((turn) =>
+            turn.getAttribute('data-turn-id')
+            || turn.getAttribute('data-testid')
+            || ''
+        ).filter(Boolean);
+        const imageUrls = Array.from(turns.flatMap((turn) =>
+            Array.from(turn.querySelectorAll('img')).map((img) => img.currentSrc || img.src || '')
+        )).filter((url) => {
+            if (!url) return false;
+            return url.includes('/backend-api/')
+                || url.includes('oaidalleapi')
+                || url.includes('openai.com')
+                || url.includes('chatgpt.com')
+                || url.includes('blob:');
+        });
+        return JSON.stringify({
+            captured_at: Date.now(),
+            known_turn_ids: turnIds,
+            known_image_urls: Array.from(new Set(imageUrls)),
+        });
+    })()""")
+
+    if not result:
+        return {"known_turn_ids": [], "known_image_urls": []}
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict):
+            data.setdefault("known_turn_ids", [])
+            data.setdefault("known_image_urls", [])
+            return data
+    except Exception:
+        pass
+    return {"known_turn_ids": [], "known_image_urls": []}
+
+
+def _remember_image_generation_anchor(ws_url: str, anchor: dict) -> None:
+    if not ws_url:
+        return
+    _IMAGE_ANCHORS_BY_WS[ws_url] = anchor
+
+
+def get_image_generation_anchor(ws_url: str) -> dict:
+    if not ws_url:
+        return {}
+    return dict(_IMAGE_ANCHORS_BY_WS.get(ws_url, {}))
 
 
 @dataclass
@@ -897,11 +954,15 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True,
         if not session.paste_prompt(prompt):
             return {"success": False, "error": "No se pudo pegar el prompt"}
 
+        image_anchor = _capture_image_generation_anchor(session)
+
         # Enviar
         if not session.send_prompt():
             if session.last_error == "rate_limited":
                 return _rate_limited_result(session)
             return {"success": False, "error": "No se pudo enviar el prompt"}
+
+        _remember_image_generation_anchor(session.ws_url, image_anchor)
 
         result = {
             "success": True,
@@ -909,6 +970,7 @@ def paste_and_send_prompt(port: int, prompt: str, wait_response: bool = True,
             "prompt_length": len(prompt),
             "sent": True,
             "target_ws": session.ws_url,
+            "image_anchor": image_anchor,
         }
 
         # Esperar respuesta si se pidió
@@ -1019,10 +1081,14 @@ def send_pasted_prompt(
                 "target_ws": session.ws_url,
             }
 
+        image_anchor = _capture_image_generation_anchor(session)
+
         if not session.send_prompt():
             if session.last_error == "rate_limited":
                 return _rate_limited_result(session)
             return {"success": False, "error": "No se pudo enviar el prompt"}
+
+        _remember_image_generation_anchor(session.ws_url, image_anchor)
 
         result = {
             "success": True,
@@ -1031,6 +1097,7 @@ def send_pasted_prompt(
             "pasted": True,
             "sent": True,
             "target_ws": session.ws_url,
+            "image_anchor": image_anchor,
         }
 
         if wait_response:
@@ -1106,6 +1173,8 @@ def paste_and_send_with_rotation(
             if not session.paste_prompt(prompt):
                 return {"success": False, "error": "No se pudo pegar el prompt"}
 
+            image_anchor = _capture_image_generation_anchor(session)
+
             # Enviar
             if not session.send_prompt():
                 if session.last_error == "rate_limited":
@@ -1127,7 +1196,9 @@ def paste_and_send_with_rotation(
                     "sent": True,
                     "rotations": rotations,
                     "target_ws": session.ws_url,
+                    "image_anchor": image_anchor,
                 }
+                _remember_image_generation_anchor(session.ws_url, image_anchor)
                 if wait_response:
                     result["response"] = session.get_last_response()
                     result["response_complete"] = True

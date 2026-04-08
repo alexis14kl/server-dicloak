@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error
-from chat_gpt_consulta.prompt_paste import ChatGPTSession
+from chat_gpt_consulta.prompt_paste import ChatGPTSession, get_image_generation_anchor
 
 
 # Directorio de salida (cross-platform)
@@ -38,16 +38,52 @@ def _build_filename(source_url: str) -> str:
     return f"{timestamp}_{safe_file_id}.png"
 
 
-def _check_image_state(session: ChatGPTSession) -> dict:
+def _check_image_state(session: ChatGPTSession, anchor: dict | None = None) -> dict:
     """Evalúa el estado actual de generación de imagen en ChatGPT.
 
     Retorna dict con: status, url, width, complete.
     status: GENERATING, COMPARISON_RESOLVED, WAITING, LOADING, READY
     """
-    result = session.evaluate("""(() => {
-        // Buscar comparación de imágenes y seleccionar la primera
+    anchor_json = json.dumps(anchor or {})
+    js = """(() => {
+        const anchor = __ANCHOR_JSON__;
+        const normalize = (value) => (value || '')
+            .toLowerCase()
+            .normalize('NFD')
+            .replace(/[\\u0300-\\u036f]/g, '')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        const knownTurnIds = new Set(Array.isArray(anchor.known_turn_ids) ? anchor.known_turn_ids : []);
+        const knownImageUrls = new Set(Array.isArray(anchor.known_image_urls) ? anchor.known_image_urls : []);
+        const turnIdOf = (turn) =>
+            turn.getAttribute('data-turn-id')
+            || turn.getAttribute('data-testid')
+            || '';
+        const isContentImage = (img) => {
+            const src = img.currentSrc || img.src || '';
+            const w = img.naturalWidth || 0;
+            if (w < 100) return false;
+            if (src.includes('avatar') || src.includes('icon')) return false;
+            return src.includes('/backend-api/')
+                || src.includes('oaidalleapi')
+                || src.includes('openai.com')
+                || src.includes('chatgpt.com')
+                || src.includes('blob:')
+                || w >= 512;
+        };
+        const scoreImage = (img) => {
+            const alt = normalize(img.alt || '');
+            const cls = normalize(img.className || '');
+            const parentCls = normalize(img.parentElement?.className || '');
+            let score = 0;
+            if (alt.includes('imagen generada') || alt.includes('generated image')) score += 4;
+            if (!cls.includes('blur') && !parentCls.includes('blur')) score += 2;
+            if (img.complete === true) score += 1;
+            return score;
+        };
+
         const compBtns = Array.from(document.querySelectorAll('button,[role="button"],label'))
-            .filter(el => /la imagen 1 es mejor|image 1 is better/i.test(
+            .filter((el) => /la imagen 1 es mejor|image 1 is better/i.test(
                 (el.innerText || el.getAttribute('aria-label') || '').trim()
             ));
         if (compBtns.length > 0) {
@@ -55,51 +91,98 @@ def _check_image_state(session: ChatGPTSession) -> dict:
             return JSON.stringify({status: 'COMPARISON_RESOLVED'});
         }
 
-        // Verificar si todavía está generando
         const stop = document.querySelector('button[data-testid="stop-button"]')
             || document.querySelector('button[aria-label="Stop generating"]')
             || document.querySelector('button[aria-label="Detener la generación"]');
-        if (stop) {
-            return JSON.stringify({status: 'GENERATING'});
-        }
-
-        // Generación terminada — buscar imagen en los ultimos bloques del chat
-        const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
-        const messages = Array.from(document.querySelectorAll('[data-message-id]'));
-        const articles = Array.from(document.querySelectorAll('article'));
-        const allBlocks = turns.length > 0 ? turns : messages.length > 0 ? messages : articles;
-        const candidates = allBlocks.slice(-3).reverse();
+        const assistantTurns = Array.from(document.querySelectorAll(
+            '[data-testid^="conversation-turn"][data-turn="assistant"], section[data-turn="assistant"]'
+        ));
+        const newAssistantTurns = assistantTurns.filter((turn) => {
+            const turnId = turnIdOf(turn);
+            return !turnId || !knownTurnIds.has(turnId);
+        });
+        const candidates = (newAssistantTurns.length > 0 ? newAssistantTurns : assistantTurns)
+            .slice(-2)
+            .reverse();
 
         for (const block of candidates) {
-            // Buscar CUALQUIER imagen grande (no solo /backend-api/)
-            const imgs = Array.from(block.querySelectorAll('img')).filter(img => {
-                const src = img.currentSrc || img.src || '';
-                const w = img.naturalWidth || 0;
-                // Filtrar: imagenes de contenido (no avatars, iconos, logos)
-                if (w < 100) return false;
-                if (src.includes('avatar') || src.includes('icon')) return false;
-                // Aceptar URLs de ChatGPT backend, oaidalleapiprodscus, etc.
-                if (src.includes('/backend-api/') || src.includes('oaidalleapi') ||
-                    src.includes('openai.com') || src.includes('chatgpt.com') ||
-                    src.includes('blob:') || w >= 512) return true;
-                return false;
-            });
+            const blockTurnId = turnIdOf(block);
+            const blockText = normalize(block.innerText || '');
+            const hasWritingBlock = !!block.querySelector('[data-writing-block]');
+            const hasFinalizingText = /finalizando imagen|finalizing image|creando imagen|creating image|generando imagen|generating image/.test(blockText);
+            const actionReady = !!block.querySelector(
+                'button[aria-label="Editar imagen"], '
+                + 'button[aria-label="Edit image"], '
+                + 'button[data-testid="good-image-turn-action-button"], '
+                + 'button[data-testid="bad-image-turn-action-button"]'
+            );
+            const imgs = Array.from(block.querySelectorAll('img'))
+                .filter(isContentImage)
+                .map((img) => {
+                    const url = img.currentSrc || img.src || '';
+                    const w = img.naturalWidth || 0;
+                    const h = img.naturalHeight || 0;
+                    const complete = img.complete === true;
+                    const known = knownImageUrls.has(url);
+                    return {
+                        url,
+                        width: w,
+                        height: h,
+                        complete,
+                        known,
+                        score: scoreImage(img),
+                    };
+                })
+                .sort((a, b) => b.score - a.score || b.width - a.width);
 
-            if (imgs.length > 0) {
-                const img = imgs[imgs.length - 1];
-                const url = img.currentSrc || img.src;
-                const w = img.naturalWidth || 0;
-                const h = img.naturalHeight || 0;
-                const complete = img.complete === true;
+            const freshImgs = imgs.filter((img) => !img.known);
+            const picked = freshImgs[0] || imgs[0] || null;
+
+            if (!newAssistantTurns.length && picked && picked.known) {
+                continue;
+            }
+
+            if (hasWritingBlock || hasFinalizingText) {
+                if (picked) {
+                    return JSON.stringify({
+                        status: 'LOADING',
+                        turn_id: blockTurnId,
+                        url: picked.url,
+                        width: picked.width,
+                        height: picked.height,
+                        complete: picked.complete,
+                        action_ready: actionReady,
+                        has_finalizing_text: hasFinalizingText,
+                    });
+                }
                 return JSON.stringify({
-                    status: (w >= 1024 && complete) ? 'READY' : 'LOADING',
-                    url, width: w, height: h, complete
+                    status: stop ? 'GENERATING' : 'WAITING',
+                    turn_id: blockTurnId,
+                    has_finalizing_text: hasFinalizingText,
+                });
+            }
+
+            if (picked) {
+                return JSON.stringify({
+                    status: (picked.width >= 1024 && picked.complete && actionReady) ? 'READY' : 'LOADING',
+                    turn_id: blockTurnId,
+                    url: picked.url,
+                    width: picked.width,
+                    height: picked.height,
+                    complete: picked.complete,
+                    action_ready: actionReady,
+                    is_fresh: !picked.known,
                 });
             }
         }
 
+        if (stop) {
+            return JSON.stringify({status: 'GENERATING'});
+        }
+
         return JSON.stringify({status: 'WAITING'});
-    })()""")
+    })()"""
+    result = session.evaluate(js.replace("__ANCHOR_JSON__", anchor_json))
 
     if not result:
         return {"status": "WAITING"}
@@ -116,7 +199,7 @@ _STABLE_CHECKS_REQUIRED = 5
 _STABLE_CHECK_INTERVAL = 3  # segundos entre cada check de estabilidad
 
 
-def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
+def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300, anchor: dict | None = None) -> str:
     """Espera que ChatGPT genere la imagen y retorna la URL final estable.
 
     La imagen de ChatGPT pasa por varias fases:
@@ -135,7 +218,7 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
     # (ChatGPT puede tardar en empezar a generar o ya haber terminado)
     initial_deadline = time.time() + 30
     while time.time() < initial_deadline:
-        initial = _check_image_state(session)
+        initial = _check_image_state(session, anchor=anchor)
         initial_status = initial.get("status", "")
         if initial_status in ("GENERATING", "LOADING", "READY", "COMPARISON_RESOLVED"):
             log_info(f"Actividad detectada: {initial_status}")
@@ -171,7 +254,7 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300) -> str:
                 log_warn("Tokens agotados detectados durante espera de imagen")
                 return ""
 
-        info = _check_image_state(session)
+        info = _check_image_state(session, anchor=anchor)
         status = info.get("status", "")
 
         if status == "GENERATING":
@@ -420,7 +503,15 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
 
     try:
         # Esperar imagen
-        image_url = wait_for_image(session, timeout_sec=timeout)
+        anchor = get_image_generation_anchor(target_ws) if target_ws else {}
+        if anchor:
+            log_info(
+                "Usando baseline de generación: "
+                f"{len(anchor.get('known_turn_ids', []))} turns previos, "
+                f"{len(anchor.get('known_image_urls', []))} URLs previas"
+            )
+
+        image_url = wait_for_image(session, timeout_sec=timeout, anchor=anchor)
         if not image_url:
             # Determinar si fue por tokens agotados o timeout genérico
             if session.last_error == "rate_limited" or session._check_rate_limited():
