@@ -293,27 +293,30 @@ class ChatGPTSession:
 
             if "un momento" in title.lower() or "just a moment" in title.lower():
                 log_info("Esperando CAPTCHA de Cloudflare...")
-                time.sleep(2)
+                time.sleep(3)
                 continue
             if title == "about:blank":
-                time.sleep(1)
+                time.sleep(2)
                 continue
 
-            # Detectar modal de rate limit y abortar para no insistir
-            if self._check_rate_limited():
-                self._mark_rate_limited()
-                self._dismiss_rate_limit_modal()
-                log_warn("Rate limit detectado en page_ready — abortando para evitar más envíos")
-                return False
-
-            # Verificar que el editor esté listo
-            ready = self.evaluate("""(() => {
+            # Un solo evaluate: editor ready + rate limit check
+            status = self.evaluate("""(() => {
+                const text = (document.body?.innerText || '').toLowerCase();
+                if (text.includes('demasiadas solicitudes') || text.includes('too many requests')
+                    || text.includes('rate limit') || text.includes('limitado temporalmente'))
+                    return 'RATE_LIMITED';
                 const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
                 return (editor && editor.getBoundingClientRect().width > 50) ? 'READY' : 'NOT_READY';
             })()""")
-            if ready and "READY" in str(ready) and "NOT" not in str(ready):
+
+            if status == "RATE_LIMITED":
+                self._mark_rate_limited()
+                self._dismiss_rate_limit_modal()
+                log_warn("Rate limit detectado en page_ready — abortando")
+                return False
+            if status == "READY":
                 return True
-            time.sleep(1)
+            time.sleep(2)
         return False
 
     def paste_prompt(self, prompt: str) -> bool:
@@ -459,10 +462,9 @@ class ChatGPTSession:
     def wait_for_response(self, timeout_sec: int = 120) -> bool:
         """Espera que ChatGPT termine de generar la respuesta."""
         deadline = time.time() + timeout_sec
-        time.sleep(3)  # Esperar a que empiece a generar
+        time.sleep(3)
 
         while time.time() < deadline:
-            # Verificar si el botón de stop está visible (generando)
             generating = self.evaluate("""(() => {
                 const stop = document.querySelector('button[data-testid="stop-button"]')
                     || document.querySelector('button[aria-label="Stop generating"]');
@@ -473,7 +475,7 @@ class ChatGPTSession:
                 log_ok("Respuesta completada")
                 return True
 
-            time.sleep(1)
+            time.sleep(3)  # 3s en vez de 1s — reduce polling
 
         log_warn("Timeout esperando respuesta")
         return False
@@ -505,47 +507,88 @@ class ChatGPTSession:
         time.sleep(2)
 
         # ── Fase única: Monitorear estado de generación ──────────────────
+        # IMPORTANTE: Un solo evaluate por ciclo para minimizar reflows del DOM.
+        # Multiples evaluates de document.body.innerText causan actividad anormal
+        # que ChatGPT detecta como rate abuse y muestra "Demasiadas solicitudes".
         idle_cycles = 0
         while time.time() < deadline:
-            if self._check_rate_limited():
+            status_raw = self.evaluate("""(() => {
+                const text = (document.body?.innerText || '').toLowerCase()
+                    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+
+                // Rate limit
+                const ratePhrases = ['demasiadas solicitudes', 'too many requests',
+                    'estas haciendo solicitudes demasiado rapido', 'rate limit',
+                    'limitado temporalmente', 'temporarily limited'];
+                if (ratePhrases.some(p => text.includes(p))) return 'RATE_LIMITED';
+
+                // Tokens agotados
+                const tokenPhrases = ['has alcanzado tu limite', 'el limite se restablece',
+                    'hit the team plan limit', 'hit the plan limit', 'youve hit',
+                    'no pude invocar la herramienta de generacion de imagenes',
+                    'cannot generate more images', 'image generation limit',
+                    'limite de creacion de imagen', 'the limit resets in'];
+                if (tokenPhrases.some(p => text.includes(p))) return 'NO_TOKENS';
+
+                // Sesion expirada
+                const sessionPhrases = ['tu sesion ha caducado', 'vuelve a iniciar sesion',
+                    'your session has expired', 'please log in', 'inicia sesion'];
+                if (sessionPhrases.some(p => text.includes(p))) return 'SESSION_EXPIRED';
+
+                // Generando
+                const stop = document.querySelector('button[data-testid="stop-button"]')
+                    || document.querySelector('button[aria-label="Stop generating"]')
+                    || document.querySelector('button[aria-label="Detener la generación"]');
+                const progress = document.querySelector('[role="progressbar"]');
+                const creating = text.includes('creando imagen') || text.includes('creating image')
+                    || text.includes('generando') || text.includes('generating');
+                return (stop || progress || creating) ? 'GENERATING' : 'IDLE';
+            })()""")
+
+            if status_raw == "RATE_LIMITED":
                 self._mark_rate_limited()
                 self._dismiss_rate_limit_modal()
                 log_warn("Rate limit detectado durante generación")
                 return "rate_limited"
 
-            if self._check_no_tokens():
+            if status_raw == "NO_TOKENS":
+                log_warn("Tokens de imagen agotados detectados")
                 return "no_image_tokens"
 
-            if self._check_session_expired():
+            if status_raw == "SESSION_EXPIRED":
                 return "session_expired"
 
-            generating = self.evaluate("""(() => {
-                const stop = document.querySelector('button[data-testid="stop-button"]')
-                    || document.querySelector('button[aria-label="Stop generating"]')
-                    || document.querySelector('button[aria-label="Detener la generación"]');
-                const progress = document.querySelector('[role="progressbar"]');
-                const body = (document.body?.innerText || '').toLowerCase();
-                const creating = body.includes('creando imagen') || body.includes('creating image')
-                    || body.includes('generando') || body.includes('generating');
-                return (stop || progress || creating) ? 'YES' : 'NO';
-            })()""")
-
-            if generating == "YES":
+            if status_raw == "GENERATING":
                 idle_cycles = 0
             else:
                 idle_cycles += 1
                 if idle_cycles >= 4:
                     break
 
-            time.sleep(1)
+            time.sleep(2)  # 2s en vez de 1s — reduce evaluates a la mitad
 
-        # ── Verificación final ───────────────────────────────────────────
+        # ── Verificación final (1 solo evaluate) ────────────────────────
         time.sleep(1)
-        if self._check_rate_limited():
+        final = self.evaluate("""(() => {
+            const text = (document.body?.innerText || '').toLowerCase()
+                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
+            if (['demasiadas solicitudes','too many requests','rate limit'].some(p => text.includes(p)))
+                return 'RATE_LIMITED';
+            if (['has alcanzado tu limite','hit the plan limit','cannot generate more images',
+                 'image generation limit','limite de creacion de imagen'].some(p => text.includes(p)))
+                return 'NO_TOKENS';
+            if (['tu sesion ha caducado','your session has expired','please log in'].some(p => text.includes(p)))
+                return 'SESSION_EXPIRED';
+            return 'SUCCESS';
+        })()""")
+
+        if final == "RATE_LIMITED":
+            self._mark_rate_limited()
+            self._dismiss_rate_limit_modal()
             return "rate_limited"
-        if self._check_no_tokens():
+        if final == "NO_TOKENS":
             return "no_image_tokens"
-        if self._check_session_expired():
+        if final == "SESSION_EXPIRED":
             return "session_expired"
 
         return "success"
