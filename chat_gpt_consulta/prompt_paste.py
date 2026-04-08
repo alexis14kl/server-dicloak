@@ -460,22 +460,54 @@ class ChatGPTSession:
         return False
 
     def wait_for_response(self, timeout_sec: int = 120) -> bool:
-        """Espera que ChatGPT termine de generar la respuesta."""
-        deadline = time.time() + timeout_sec
-        time.sleep(3)
+        """Espera que ChatGPT termine de generar — sin polling, usa MutationObserver."""
+        timeout_ms = timeout_sec * 1000
 
-        while time.time() < deadline:
-            generating = self.evaluate("""(() => {
-                const stop = document.querySelector('button[data-testid="stop-button"]')
-                    || document.querySelector('button[aria-label="Stop generating"]');
-                return stop ? 'GENERATING' : 'DONE';
-            })()""")
+        result = self.evaluate(f"""
+        new Promise((resolve) => {{
+            function isGenerating() {{
+                return !!(
+                    document.querySelector('button[data-testid="stop-button"]')
+                    || document.querySelector('button[aria-label="Stop generating"]')
+                );
+            }}
 
-            if generating != "GENERATING":
-                log_ok("Respuesta completada")
-                return True
+            // Si ya terminó
+            if (!isGenerating()) {{ resolve('DONE'); return; }}
 
-            time.sleep(3)  # 3s en vez de 1s — reduce polling
+            let observer = null;
+            let timer = null;
+
+            function cleanup() {{
+                if (observer) observer.disconnect();
+                if (timer) clearTimeout(timer);
+            }}
+
+            observer = new MutationObserver(() => {{
+                if (!isGenerating()) {{
+                    cleanup();
+                    resolve('DONE');
+                }}
+            }});
+
+            observer.observe(document.body, {{
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['data-testid', 'aria-label'],
+            }});
+
+            timer = setTimeout(() => {{
+                cleanup();
+                resolve(isGenerating() ? 'TIMEOUT' : 'DONE');
+            }}, {timeout_ms});
+        }})
+        """, timeout=timeout_sec + 10, await_promise=True)
+
+        status = str(result or "DONE").strip()
+        if status == "DONE":
+            log_ok("Respuesta completada")
+            return True
 
         log_warn("Timeout esperando respuesta")
         return False
@@ -493,102 +525,126 @@ class ChatGPTSession:
     # ── Detección de tokens y sesión ─────────────────────────────────────
 
     def detect_token_status(self, timeout_sec: int = 90) -> str:
-        """Espera la respuesta de ChatGPT y detecta si hay error de tokens, sesión o rate limit.
+        """Espera la respuesta de ChatGPT sin polling — usa MutationObserver.
+
+        Inyecta UN solo evaluate con awaitPromise=True que:
+          1. Configura MutationObserver en el DOM
+          2. El observer detecta cuando ChatGPT termina (stop button desaparece)
+          3. La Promise resuelve con el estado: SUCCESS, NO_TOKENS, RATE_LIMITED, etc.
+
+        CERO polling, CERO reflows repetidos. Solo 1 lectura de innerText al final.
 
         Retorna: 'success', 'no_image_tokens', 'session_expired', 'rate_limited'
-
-        Flujo simplificado:
-          1. Esperar que ChatGPT termine de generar (stop button desaparece)
-          2. Verificar si la respuesta es un error de tokens/rate limit
         """
-        deadline = time.time() + timeout_sec
+        timeout_ms = timeout_sec * 1000
 
-        # Esperar un momento para que ChatGPT empiece a procesar
-        time.sleep(2)
+        result = self.evaluate(f"""
+        new Promise((resolve) => {{
+            const TIMEOUT = {timeout_ms};
+            const CHECK_INTERVAL = 5000;  // verificar texto cada 5s (solo si idle)
 
-        # ── Fase única: Monitorear estado de generación ──────────────────
-        # IMPORTANTE: Un solo evaluate por ciclo para minimizar reflows del DOM.
-        # Multiples evaluates de document.body.innerText causan actividad anormal
-        # que ChatGPT detecta como rate abuse y muestra "Demasiadas solicitudes".
-        idle_cycles = 0
-        while time.time() < deadline:
-            status_raw = self.evaluate("""(() => {
+            const ratePhrases = ['demasiadas solicitudes', 'too many requests',
+                'rate limit', 'limitado temporalmente', 'temporarily limited'];
+            const tokenPhrases = ['has alcanzado tu limite', 'el limite se restablece',
+                'hit the team plan limit', 'hit the plan limit', 'youve hit',
+                'no pude invocar la herramienta de generacion de imagenes',
+                'cannot generate more images', 'image generation limit',
+                'limite de creacion de imagen', 'the limit resets in'];
+            const sessionPhrases = ['tu sesion ha caducado', 'vuelve a iniciar sesion',
+                'your session has expired', 'please log in', 'inicia sesion'];
+
+            function checkText() {{
                 const text = (document.body?.innerText || '').toLowerCase()
                     .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
-
-                // Rate limit
-                const ratePhrases = ['demasiadas solicitudes', 'too many requests',
-                    'estas haciendo solicitudes demasiado rapido', 'rate limit',
-                    'limitado temporalmente', 'temporarily limited'];
                 if (ratePhrases.some(p => text.includes(p))) return 'RATE_LIMITED';
-
-                // Tokens agotados
-                const tokenPhrases = ['has alcanzado tu limite', 'el limite se restablece',
-                    'hit the team plan limit', 'hit the plan limit', 'youve hit',
-                    'no pude invocar la herramienta de generacion de imagenes',
-                    'cannot generate more images', 'image generation limit',
-                    'limite de creacion de imagen', 'the limit resets in'];
                 if (tokenPhrases.some(p => text.includes(p))) return 'NO_TOKENS';
-
-                // Sesion expirada
-                const sessionPhrases = ['tu sesion ha caducado', 'vuelve a iniciar sesion',
-                    'your session has expired', 'please log in', 'inicia sesion'];
                 if (sessionPhrases.some(p => text.includes(p))) return 'SESSION_EXPIRED';
+                return null;
+            }}
 
-                // Generando
-                const stop = document.querySelector('button[data-testid="stop-button"]')
+            function isGenerating() {{
+                return !!(
+                    document.querySelector('button[data-testid="stop-button"]')
                     || document.querySelector('button[aria-label="Stop generating"]')
-                    || document.querySelector('button[aria-label="Detener la generación"]');
-                const progress = document.querySelector('[role="progressbar"]');
-                const creating = text.includes('creando imagen') || text.includes('creating image')
-                    || text.includes('generando') || text.includes('generating');
-                return (stop || progress || creating) ? 'GENERATING' : 'IDLE';
-            })()""")
+                    || document.querySelector('button[aria-label="Detener la generación"]')
+                    || document.querySelector('[role="progressbar"]')
+                );
+            }}
 
-            if status_raw == "RATE_LIMITED":
-                self._mark_rate_limited()
-                self._dismiss_rate_limit_modal()
-                log_warn("Rate limit detectado durante generación")
-                return "rate_limited"
+            let idleCount = 0;
+            let textCheckTimer = null;
+            let timeoutTimer = null;
+            let observer = null;
 
-            if status_raw == "NO_TOKENS":
-                log_warn("Tokens de imagen agotados detectados")
-                return "no_image_tokens"
+            function cleanup() {{
+                if (observer) observer.disconnect();
+                if (textCheckTimer) clearInterval(textCheckTimer);
+                if (timeoutTimer) clearTimeout(timeoutTimer);
+            }}
 
-            if status_raw == "SESSION_EXPIRED":
-                return "session_expired"
+            function done(status) {{
+                cleanup();
+                resolve(status);
+            }}
 
-            if status_raw == "GENERATING":
-                idle_cycles = 0
-            else:
-                idle_cycles += 1
-                if idle_cycles >= 4:
-                    break
+            // Check inmediato por si ya hay error visible
+            const immediate = checkText();
+            if (immediate) {{ done(immediate); return; }}
 
-            time.sleep(2)  # 2s en vez de 1s — reduce evaluates a la mitad
+            // Timer: verificar texto periodicamente (cada 5s, ligero)
+            textCheckTimer = setInterval(() => {{
+                const status = checkText();
+                if (status) {{ done(status); return; }}
 
-        # ── Verificación final (1 solo evaluate) ────────────────────────
-        time.sleep(1)
-        final = self.evaluate("""(() => {
-            const text = (document.body?.innerText || '').toLowerCase()
-                .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');
-            if (['demasiadas solicitudes','too many requests','rate limit'].some(p => text.includes(p)))
-                return 'RATE_LIMITED';
-            if (['has alcanzado tu limite','hit the plan limit','cannot generate more images',
-                 'image generation limit','limite de creacion de imagen'].some(p => text.includes(p)))
-                return 'NO_TOKENS';
-            if (['tu sesion ha caducado','your session has expired','please log in'].some(p => text.includes(p)))
-                return 'SESSION_EXPIRED';
-            return 'SUCCESS';
-        })()""")
+                // Si no está generando, contar idle
+                if (!isGenerating()) {{
+                    idleCount++;
+                    if (idleCount >= 3) {{ done('SUCCESS'); }}
+                }} else {{
+                    idleCount = 0;
+                }}
+            }}, CHECK_INTERVAL);
 
-        if final == "RATE_LIMITED":
+            // MutationObserver: detectar cuando el stop button desaparece
+            observer = new MutationObserver(() => {{
+                if (!isGenerating()) {{
+                    // Generacion terminó — esperar 2s y verificar resultado
+                    setTimeout(() => {{
+                        const status = checkText();
+                        done(status || 'SUCCESS');
+                    }}, 2000);
+                }}
+            }});
+
+            observer.observe(document.body, {{
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['data-testid', 'aria-label', 'role'],
+            }});
+
+            // Timeout absoluto
+            timeoutTimer = setTimeout(() => {{
+                const status = checkText();
+                done(status || 'SUCCESS');
+            }}, TIMEOUT);
+        }})
+        """, timeout=timeout_sec + 10, await_promise=True)
+
+        status = str(result or "SUCCESS").strip()
+        log_info(f"detect_token_status resultado: {status}")
+
+        if status == "RATE_LIMITED":
             self._mark_rate_limited()
             self._dismiss_rate_limit_modal()
+            log_warn("Rate limit detectado durante generación")
             return "rate_limited"
-        if final == "NO_TOKENS":
+
+        if status == "NO_TOKENS":
+            log_warn("Tokens de imagen agotados detectados")
             return "no_image_tokens"
-        if final == "SESSION_EXPIRED":
+
+        if status == "SESSION_EXPIRED":
             return "session_expired"
 
         return "success"
