@@ -157,13 +157,18 @@ class ChatGPTSession:
         return self.connect()
 
     def evaluate(self, expression: str, timeout: int = 10, await_promise: bool = False) -> str | None:
-        """Evalúa JavaScript en la página de ChatGPT."""
+        """Evalúa JavaScript en la página de ChatGPT.
+
+        Para awaitPromise=True usa recv con chunks cortos (5s) para no bloquear
+        el proceso y permitir Ctrl+C.
+        """
         if not self._ensure_connected():
             return None
 
         self._msg_id += 1
+        expected_id = self._msg_id
         msg = json.dumps({
-            "id": self._msg_id,
+            "id": expected_id,
             "method": "Runtime.evaluate",
             "params": {
                 "expression": expression,
@@ -174,10 +179,29 @@ class ChatGPTSession:
 
         try:
             self._ws.send(msg)
-            resp_raw = self._ws.recv(timeout=timeout)
-            data = json.loads(resp_raw)
-            result = data.get("result", {}).get("result", {})
-            return result.get("value", json.dumps(result))
+
+            # Para awaitPromise: recv en chunks cortos para no bloquear Ctrl+C
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                chunk_timeout = min(5, deadline - time.time())
+                if chunk_timeout <= 0:
+                    break
+                try:
+                    resp_raw = self._ws.recv(timeout=chunk_timeout)
+                    data = json.loads(resp_raw)
+                    # Ignorar eventos CDP que no son nuestra respuesta
+                    if data.get("id") == expected_id:
+                        result = data.get("result", {}).get("result", {})
+                        return result.get("value", json.dumps(result))
+                except TimeoutError:
+                    continue
+                except Exception:
+                    if not await_promise:
+                        raise
+                    continue
+
+            log_warn(f"CDP evaluate timeout ({timeout}s)")
+            return None
         except Exception as e:
             log_warn(f"CDP evaluate error: {e}")
             self._ws = None
