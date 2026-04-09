@@ -14,10 +14,6 @@ from dataclasses import dataclass, field
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error
-from platform_utils import (
-    os_click, os_click_window, find_browser_hwnd,
-    get_visible_hwnds, find_new_tooltip_hwnd, get_window_size, IS_WINDOWS,
-)
 
 
 VEO3_URL = "https://labs.google/fx/tools/flow"
@@ -289,10 +285,8 @@ class Veo3Session:
         log_error("No se pudo completar el login de Google")
         return False
 
-    def _get_screen_coords(self, selector: str) -> dict | None:
-        """Obtiene coordenadas absolutas de pantalla de un elemento DOM.
-        Necesario para OS clicks que activan el autofill nativo de DiCloak.
-        """
+    def _get_client_coords(self, selector: str) -> dict | None:
+        """Obtiene coordenadas del viewport para clicks virtuales CDP."""
         result = self.evaluate(f"""(() => {{
             const el = document.querySelector('{selector}');
             if (!el) return null;
@@ -300,58 +294,77 @@ class Veo3Session:
             return JSON.stringify({{
                 cx: rect.x + rect.width / 2,
                 cy: rect.y + rect.height / 2,
-                bottom: rect.y + rect.height,
-                screenX: window.screenX,
-                screenY: window.screenY,
-                chromeH: window.outerHeight - window.innerHeight,
             }});
         }})()""")
         if not result:
             return None
         try:
-            data = json.loads(result)
-            data["screen_cx"] = int(data["screenX"] + data["cx"])
-            data["screen_cy"] = int(data["screenY"] + data["chromeH"] + data["cy"])
-            data["screen_bottom"] = int(data["screenY"] + data["chromeH"] + data["bottom"])
-            return data
+            return json.loads(result)
         except Exception:
             return None
 
+    def _cdp_click(self, x: float, y: float):
+        """Click virtual via CDP sin mover el cursor del usuario."""
+        for event_type in ("mouseMoved", "mousePressed", "mouseReleased"):
+            self._send_raw("Input.dispatchMouseEvent", {
+                "type": event_type,
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1,
+            })
+            time.sleep(0.04)
+
+    def _send_strong_key(self, key: str, code: str, vk: int):
+        """Envía una tecla con rawKeyDown+keyDown+keyUp para popups nativos."""
+        params = {
+            "key": key,
+            "code": code,
+            "windowsVirtualKeyCode": vk,
+            "nativeVirtualKeyCode": vk,
+        }
+        self._send_raw("Input.dispatchKeyEvent", {"type": "rawKeyDown", **params})
+        time.sleep(0.04)
+        self._send_raw("Input.dispatchKeyEvent", {"type": "keyDown", **params})
+        time.sleep(0.04)
+        self._send_raw("Input.dispatchKeyEvent", {"type": "keyUp", **params})
+        time.sleep(0.22)
+
     def _handle_password_page(self) -> bool:
         """Activa autofill de DiCloak en página de contraseña de Google.
-        Click real (pyautogui) en campo password → tooltip → autofill → Siguiente.
+        Flujo validado: click virtual al input → ArrowDown fuerte → Enter fuerte.
         """
         # Esperar carga de la página
         for _ in range(10):
-            has_pwd = self.evaluate("document.readyState === 'complete' && !!document.querySelector('input[name=\"Passwd\"]')")
+            has_pwd = self.evaluate("document.readyState === 'complete' && !!document.querySelector('input[name=\"Passwd\"], input[type=\"password\"]')")
             if has_pwd:
                 break
             time.sleep(1)
-        time.sleep(1)
+        time.sleep(0.6)
 
-        # Coordenadas del campo
-        pwd_coords = self._get_screen_coords('input[name="Passwd"]')
+        # Coordenadas del campo para click virtual
+        pwd_coords = self._get_client_coords('input[name="Passwd"]')
         if not pwd_coords:
-            pwd_coords = self._get_screen_coords('input[type="password"]')
+            pwd_coords = self._get_client_coords('input[type="password"]')
         if not pwd_coords:
             log_warn("No se encontró campo de contraseña")
             return False
 
-        # Click real en campo password
+        # Click virtual en el input para abrir el popup nativo de passwords
         self._send_raw("Page.bringToFront")
         time.sleep(0.3)
-        os_click(pwd_coords["screen_cx"], pwd_coords["screen_cy"])
-        time.sleep(2)
+        self._cdp_click(pwd_coords["cx"], pwd_coords["cy"])
+        time.sleep(0.3)
 
-        # Click en tooltip DiCloak (debajo del campo)
-        pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
-        if not pwd_len or int(pwd_len) == 0:
-            os_click(pwd_coords["screen_cx"], pwd_coords["screen_bottom"] + 25)
-            time.sleep(2)
-            pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
+        # Navegar popup nativo con teclas "fuertes"
+        self._send_strong_key("ArrowDown", "ArrowDown", 40)
+        self._send_strong_key("Enter", "Enter", 13)
+        time.sleep(0.6)
+
+        pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"], input[type=\"password\"]')?.value.length || 0")
 
         if not pwd_len or int(pwd_len) == 0:
-            log_warn("No se pudo activar autofill de DiCloak")
+            log_warn("No se pudo activar autofill de DiCloak con click virtual + ArrowDown + Enter")
             return False
 
         log_ok(f"Password autofill ({pwd_len} chars)")
