@@ -800,7 +800,7 @@ def _save_artifact(file_path: str, artifact_type: str = "video", meta: dict = No
         log_warn(f"[DB] Error guardando artifact: {e}")
 
 
-def download_extended_video(port: int, timeout: int = 600, output_dir: str = "") -> dict:
+def download_extended_video(port: int, timeout: int = 70, output_dir: str = "") -> dict:
     """POST /veo3/download-video — Espera extension + descarga Full Video."""
     log_info(f"[DESCARGA] Iniciando descarga en puerto {port} (timeout {timeout}s)")
 

@@ -370,7 +370,7 @@ class Veo3ExtendVideoRequest(BaseModel):
 
 class Veo3DownloadVideoRequest(BaseModel):
     port: int
-    timeout: int = 600
+    timeout: int = 70
     output_dir: str = ""
 
 
