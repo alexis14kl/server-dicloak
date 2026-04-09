@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from logger import log_info, log_ok, log_warn, log_error
+from logger import log_info, log_ok, log_warn, log_error, capture_logs
 from platform_utils import (
     os_click, os_click_window, find_browser_hwnd,
     get_visible_hwnds, find_new_tooltip_hwnd, get_window_size, IS_WINDOWS,
@@ -24,6 +24,24 @@ VEO3_URL = "https://labs.google/fx/tools/flow"
 VIDEO_FX_URL = "https://labs.google/fx/tools/video-fx"
 
 
+# ── Errores clasificados del flujo de login ────────────────────────────────
+# Códigos expuestos (para orchestrator Django / cliente Python):
+#   - password_input_not_found   → No se encontró el campo input[name="Passwd"]
+#   - password_not_saved         → El autofill no disparó (Chrome no tiene password guardada para el email)
+#   - next_button_not_found      → No se encontró el botón "Siguiente/Next" tras autofill
+#   - next_button_click_failed   → Botón encontrado pero CDP dispatchMouseEvent falló
+#   - google_flow_redirect_timeout → Tras click en Siguiente, Google no redirigió a labs.google
+#   - page_load_timeout          → Tras navegar a Flow, la página no alcanzó readyState=complete
+#   - account_chooser_no_accounts → Pantalla "Elige una cuenta" pero no hay [data-identifier]
+#   - flow_signin_button_not_found → Landing de Flow con prompt de Sign in pero no se encontró el botón
+#   - login_state_unknown        → Página cargó pero no es Flow, ni chooser, ni sign-in, ni password
+class Veo3LoginError(RuntimeError):
+    """Error clasificado del flujo de login Google → Veo 3."""
+    def __init__(self, code: str, message: str = "") -> None:
+        self.code = code
+        super().__init__(f"[{code}] {message}" if message else f"[{code}]")
+
+
 @dataclass
 class Veo3Session:
     """Sesión CDP activa con Google Flow (Veo 3)."""
@@ -32,8 +50,12 @@ class Veo3Session:
     _ws: object = field(default=None, repr=False)
     _msg_id: int = field(default=0, repr=False)
 
-    def connect(self) -> bool:
-        """Conecta al CDP del navegador."""
+    def connect(self, cleanup_other_tabs: bool = True) -> bool:
+        """Conecta al CDP del navegador.
+
+        Selecciona el tab correcto (Flow > accounts.google > crea uno nuevo),
+        opcionalmente cierra los otros tabs irrelevantes para evitar clutter.
+        """
         try:
             import websockets.sync.client as ws_sync
         except ImportError:
@@ -41,44 +63,139 @@ class Veo3Session:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
             import websockets.sync.client as ws_sync
 
-        # Buscar página de Flow o cualquier página activa
-        ws_url = self._find_best_target()
+        selected = self._select_or_create_flow_tab()
+        if not selected:
+            log_warn(f"No se encontró ni pudo crear tab en puerto {self.port}")
+            return False
+
+        ws_url = selected.get("webSocketDebuggerUrl", "")
+        target_id = selected.get("id", "")
         if not ws_url:
-            log_warn(f"No se encontró página en puerto {self.port}")
+            log_warn(f"Target sin webSocketDebuggerUrl en puerto {self.port}")
             return False
 
         try:
             self._ws = ws_sync.connect(ws_url, max_size=2**22)
-            log_ok(f"Veo3 conectado en puerto {self.port}")
-            return True
+            self.ws_url = ws_url
+            log_ok(f"Veo3 conectado en puerto {self.port} — target={target_id[:12]} url={(selected.get('url') or '')[:60]}")
         except Exception as e:
             log_warn(f"Error conectando: {e}")
             self._ws = None
             return False
 
-    def _find_best_target(self) -> str:
-        """Busca la mejor página para conectar (Flow > cualquier página)."""
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=3) as resp:
-                targets = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            return ""
+        if cleanup_other_tabs and target_id:
+            self._close_other_tabs(target_id)
 
-        # Prioridad: página de Flow > cualquier página
+        return True
+
+    def _list_page_targets(self) -> list[dict]:
+        """Lee /json del CDP y retorna solo los targets de tipo 'page'.
+
+        Timeout duro de 5s. Retorna lista vacía si falla.
+        """
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            log_warn(f"No se pudo leer /json en puerto {self.port}: {exc}")
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [t for t in raw if isinstance(t, dict) and t.get("type") == "page"]
+
+    def _select_or_create_flow_tab(self) -> dict | None:
+        """Elige el tab correcto del perfil DiCloak.
+
+        Prioridad:
+          1. Tab con url que contenga 'labs.google/fx' (sesión Flow activa).
+          2. Tab con url que contenga 'accounts.google.com' (login en curso).
+          3. Tab no-devtools cualquiera (reutiliza para navegar).
+          4. Si no hay ninguno → crea uno con Target.createTarget(VEO3_URL).
+
+        Retorna el dict del target seleccionado, o None si todo falló.
+        """
+        pages = self._list_page_targets()
+
         flow_target = None
+        auth_target = None
         any_page = None
-        for t in targets:
-            if t.get("type") != "page":
-                continue
+        for t in pages:
             url = (t.get("url") or "").lower()
+            # Descartar DevTools embebido
+            if url.startswith("devtools://") or "chrome-devtools" in url:
+                continue
             if "labs.google/fx" in url and "accounts.google" not in url:
                 flow_target = t
                 break
-            if not any_page and url and url != "about:blank":
+            if "accounts.google.com" in url and not auth_target:
+                auth_target = t
+                continue
+            if not any_page:
                 any_page = t
 
-        target = flow_target or any_page
-        return target.get("webSocketDebuggerUrl", "") if target else ""
+        selected = flow_target or auth_target or any_page
+        if selected:
+            return selected
+
+        # Fallback: crear un tab nuevo navegando a Flow
+        log_info(f"Sin tabs utilizables — creando tab nuevo con VEO3_URL")
+        new_id = self._create_target(VEO3_URL)
+        if not new_id:
+            return None
+        # Releer /json para obtener el webSocketDebuggerUrl del tab recién creado
+        for t in self._list_page_targets():
+            if t.get("id") == new_id:
+                return t
+        return None
+
+    def _create_target(self, url: str) -> str:
+        """Crea un tab nuevo via HTTP /json/new?<url>. Retorna targetId o ''.
+
+        DiCloak expone el endpoint clásico de Chromium. Timeout 5s.
+        """
+        try:
+            from urllib.parse import quote
+            req_url = f"http://127.0.0.1:{self.port}/json/new?{quote(url, safe=':/?&=')}"
+            req = urllib.request.Request(req_url, method="PUT")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                # Algunos Chromium aceptan GET en lugar de PUT
+                with urllib.request.urlopen(req_url, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict):
+                return data.get("id", "") or ""
+        except Exception as exc:
+            log_warn(f"createTarget falló: {exc}")
+        return ""
+
+    def _close_other_tabs(self, keep_target_id: str) -> int:
+        """Cierra todos los tabs 'page' excepto el seleccionado y DevTools.
+
+        Retorna la cantidad de tabs cerrados. Timeout 5s por tab.
+        """
+        if not keep_target_id:
+            return 0
+        closed = 0
+        for t in self._list_page_targets():
+            tab_id = t.get("id", "")
+            if not tab_id or tab_id == keep_target_id:
+                continue
+            url = (t.get("url") or "").lower()
+            if url.startswith("devtools://") or "chrome-devtools" in url:
+                continue
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{self.port}/json/close/{tab_id}", timeout=5
+                ):
+                    pass
+                closed += 1
+            except Exception as exc:
+                log_warn(f"closeTarget {tab_id[:12]} falló: {exc}")
+        if closed:
+            log_ok(f"Cerrados {closed} tab(s) irrelevante(s). Queda 1 activo.")
+        return closed
 
     def is_connected(self) -> bool:
         if self._ws is None:
@@ -93,7 +210,10 @@ class Veo3Session:
     def _ensure_connected(self) -> bool:
         if self.is_connected():
             return True
-        return self.connect()
+        # Reconnect sin cerrar tabs — el cleanup solo corre en el primer
+        # connect() de la sesión para no cerrar tabs que alguien más abrió
+        # después (p.ej. popups de Google auth legítimos).
+        return self.connect(cleanup_other_tabs=False)
 
     def evaluate(self, expression: str, timeout: int = 10, await_promise: bool = False) -> str | None:
         """Evalúa JavaScript en la página."""
@@ -182,6 +302,169 @@ class Veo3Session:
                 or "error=callback" in url
                 or "sign in" in (self.evaluate("document.title") or "").lower())
 
+    # ── Espera de carga y detección de estado post-load ─────────────────────
+
+    def wait_for_page_load(self, timeout_sec: int = 20) -> bool:
+        """Espera a que document.readyState === 'complete'.
+
+        Poll cada 0.5s con timeout duro. Sin reconexiones defensivas, sin
+        fallbacks. Retorna True si cargó, False si timeout.
+        KISS: solo readyState, no esperamos networkidle ni "settle" del JS —
+        eso lo cubre el pequeño sleep final.
+        """
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            ready = self.evaluate("document.readyState")
+            if ready == "complete":
+                # Settle mínimo para que el JS monte el DOM (account chooser
+                # suele aparecer ~500ms después de ready).
+                time.sleep(1.5)
+                return True
+            time.sleep(0.5)
+        return False
+
+    def detect_page_state(self) -> dict:
+        """Clasifica el estado de la página actual tras wait_for_page_load.
+
+        Estados posibles (mutuamente excluyentes, devuelto en campo 'state'):
+          - 'flow_signin_prompt' → labs.google/fx landing con botón
+                                "Sign in with Google" visible (sesión NO activa,
+                                requiere click previo antes del chooser).
+          - 'flow'            → ya en labs.google/fx (sesión activa)
+          - 'password'        → input[name="Passwd"] visible (challenge/pwd)
+          - 'account_chooser' → [data-identifier] visible (Elige una cuenta,
+                                incluye estado "Saliste de la cuenta")
+          - 'sign_in'         → input[type="email"] visible (login completo)
+          - 'unknown'         → ninguno de los anteriores
+
+        Retorna dict con: state, url, identifier_count, title.
+        Single evaluate() — no hace multiple round-trips.
+        """
+        raw = self.evaluate("""(() => {
+            const url = (window.location.href || '').toLowerCase();
+            const title = document.title || '';
+            let state = 'unknown';
+
+            // Detecta botón "Sign in with Google" en landing de Flow.
+            // Criterios: elemento clickable visible cuyo innerText contenga
+            // 'google' Y alguno de {sign in, iniciar sesión, acceder}.
+            const hasFlowSigninButton = () => {
+                const cands = Array.from(document.querySelectorAll(
+                    'button, a, [role="button"]'
+                )).filter(el => el.offsetParent !== null);
+                return cands.some(el => {
+                    const t = ((el.innerText || '') + ' ' +
+                               (el.getAttribute('aria-label') || '')).toLowerCase();
+                    if (!t.includes('google')) return false;
+                    return t.includes('sign in') || t.includes('iniciar sesión')
+                        || t.includes('iniciar sesion') || t.includes('acceder');
+                });
+            };
+
+            const onFlowUrl = url.includes('labs.google/fx') && !url.includes('accounts.google');
+
+            if (onFlowUrl && hasFlowSigninButton()) {
+                // Landing de Flow: URL válida pero sesión NO activa — hay que
+                // clickear "Sign in with Google" primero.
+                state = 'flow_signin_prompt';
+            } else if (onFlowUrl) {
+                state = 'flow';
+            } else if (document.querySelector('input[name="Passwd"]')) {
+                state = 'password';
+            } else {
+                // Account chooser: cualquier [data-identifier] visible (incluso
+                // si dice "Saliste de la cuenta" — Google conserva el elemento).
+                const idents = Array.from(document.querySelectorAll('[data-identifier]'))
+                    .filter(el => el.offsetParent !== null);
+                if (idents.length > 0) {
+                    state = 'account_chooser';
+                } else if (document.querySelector('input[type="email"]')) {
+                    state = 'sign_in';
+                }
+            }
+
+            return JSON.stringify({
+                state,
+                url,
+                title,
+                identifier_count: document.querySelectorAll('[data-identifier]').length,
+            });
+        })()""")
+
+        if not raw:
+            return {"state": "unknown", "url": "", "title": "", "identifier_count": 0}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"state": "unknown", "url": "", "title": "", "identifier_count": 0}
+
+    def click_account_chooser(self) -> str:
+        """Click en el primer [data-identifier] visible. Retorna el email o ''.
+
+        Funciona incluso para cuentas en estado "Saliste de la cuenta": Google
+        mantiene el elemento y acepta el click, tras lo cual redirige a
+        challenge/pwd (flujo ya manejado por _handle_password_page).
+        """
+        raw = self.evaluate("""(() => {
+            const extractEmail = (text) => {
+                const m = (text || '').match(/[\\w.+-]+@[\\w-]+\\.[\\w.-]+/);
+                return m ? m[0] : '';
+            };
+            const idents = Array.from(document.querySelectorAll('[data-identifier]'))
+                .filter(el => el.offsetParent !== null);
+            if (!idents.length) return '';
+            const el = idents[0];
+            const email = el.getAttribute('data-identifier')
+                || extractEmail(el.innerText || '');
+            el.click();
+            return email || '@unknown';
+        })()""")
+        return (raw or "").strip()
+
+    def click_flow_signin_button(self) -> bool:
+        """Click en el botón "Sign in with Google" de la landing de Flow.
+
+        Invocado cuando detect_page_state devuelve 'flow_signin_prompt'. Busca
+        el botón por texto visible + presencia de 'google', lo clickea y deja
+        a Google manejar la redirección a accounts.google.com (donde el flujo
+        continuará como account_chooser o password).
+
+        Lanza Veo3LoginError('flow_signin_button_not_found') si no aparece.
+        KISS: single evaluate, sin polling — el caller ya esperó wait_for_page_load.
+        """
+        raw = self.evaluate("""(() => {
+            const cands = Array.from(document.querySelectorAll(
+                'button, a, [role="button"]'
+            )).filter(el => el.offsetParent !== null);
+            const btn = cands.find(el => {
+                const t = ((el.innerText || '') + ' ' +
+                           (el.getAttribute('aria-label') || '')).toLowerCase();
+                if (!t.includes('google')) return false;
+                return t.includes('sign in') || t.includes('iniciar sesión')
+                    || t.includes('iniciar sesion') || t.includes('acceder');
+            });
+            if (!btn) return JSON.stringify({ok: false});
+            btn.click();
+            return JSON.stringify({
+                ok: true,
+                text: (btn.innerText || '').trim().slice(0, 60),
+            });
+        })()""")
+
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {}
+
+        if not data.get("ok"):
+            raise Veo3LoginError(
+                "flow_signin_button_not_found",
+                "Landing de Flow detectada pero no se encontró botón 'Sign in with Google'",
+            )
+
+        log_ok(f"Click en botón Flow sign-in: '{data.get('text', '?')}'")
+        return True
+
     def handle_google_login(self, timeout_sec: int = 45) -> bool:
         """Maneja el login de Google: click en cuenta guardada."""
         log_info("Login de Google detectado. Seleccionando cuenta guardada...")
@@ -195,35 +478,59 @@ class Veo3Session:
                 log_ok("Login de Google completado")
                 return True
 
-            # Primero intentar click en cuenta guardada (account chooser)
-            clicked = self.evaluate("""(() => {
+            # Primero intentar click en cuenta guardada (account chooser).
+            # Retorna JSON {strategy, email} para poder matchear luego en el dropdown de passwords.
+            clicked_raw = self.evaluate("""(() => {
+                const extractEmail = (text) => {
+                    const m = (text || '').match(/[\\w.+-]+@[\\w-]+\\.[\\w.-]+/);
+                    return m ? m[0] : '';
+                };
+                const done = (strategy, el) => JSON.stringify({
+                    strategy,
+                    email: extractEmail(
+                        el.getAttribute?.('data-identifier') ||
+                        el.getAttribute?.('data-email') ||
+                        el.innerText || ''
+                    ),
+                });
+
                 // Estrategia 1: data-identifier (cuenta guardada)
                 const byId = document.querySelector('[data-identifier]');
-                if (byId) { byId.click(); return 'data-identifier'; }
+                if (byId) { byId.click(); return done('data-identifier', byId); }
 
                 // Estrategia 2: primer <li> con email
                 const items = document.querySelectorAll('ul li');
                 for (const li of items) {
                     const text = li.innerText || '';
-                    if (text.includes('@')) { li.click(); return 'email-li'; }
+                    if (text.includes('@')) { li.click(); return done('email-li', li); }
                 }
 
                 // Estrategia 3: div con data-email
                 const emailDiv = document.querySelector('[data-email]');
-                if (emailDiv) { emailDiv.click(); return 'data-email'; }
+                if (emailDiv) { emailDiv.click(); return done('data-email', emailDiv); }
 
                 // Estrategia 4: cualquier elemento con email visible
                 const all = document.querySelectorAll('div, a, button');
                 for (const el of all) {
                     const t = (el.innerText || '').trim();
-                    if (/@.*\\.com/.test(t) && t.length < 60) { el.click(); return 'email-text'; }
+                    if (/@.*\\.com/.test(t) && t.length < 60) { el.click(); return done('email-text', el); }
                 }
 
                 return null;
             })()""")
 
-            if clicked and clicked != "null":
-                log_ok(f"Click en cuenta de Google ({clicked})")
+            clicked = None
+            selected_email = ""
+            if clicked_raw and clicked_raw != "null":
+                try:
+                    info = json.loads(clicked_raw)
+                    clicked = info.get("strategy")
+                    selected_email = (info.get("email") or "").strip().lower()
+                except Exception:
+                    clicked = clicked_raw  # fallback tolerante
+
+            if clicked:
+                log_ok(f"Click en cuenta de Google ({clicked}) email={selected_email or '?'}")
 
                 # Esperar a que la URL cambie — NO reconectar, el WS sigue vivo
                 url_after = ""
@@ -240,8 +547,12 @@ class Veo3Session:
 
                 # Verificar si necesita contraseña
                 if "challenge/pwd" in url_after:
-                    log_info("Página de contraseña detectada. Usando OS click para autofill DiCloak...")
-                    self._handle_password_page()
+                    log_info(f"Página de contraseña detectada para {selected_email or '?'}")
+                    try:
+                        self._handle_password_page(expected_email=selected_email)
+                    except Veo3LoginError as exc:
+                        log_error(f"Fallo en password step: {exc}")
+                        return False
 
                 elif "accounts.google" in url_after:
                     # Otra página de Google — click en Siguiente genérico
@@ -317,61 +628,400 @@ class Veo3Session:
         except Exception:
             return None
 
-    def _handle_password_page(self) -> bool:
-        """Activa autofill de DiCloak en página de contraseña de Google.
-        Click real (pyautogui) en campo password → tooltip → autofill → Siguiente.
+    def _handle_password_page(self, expected_email: str = "") -> bool:
+        """Autofill de password en la pantalla "Enter your password" de Google.
+
+        Estrategia (opción C — navegación por teclado, sin guardar credenciales):
+          1. Esperar a que cargue input[name="Passwd"].
+          2. Focus vía CDP en el campo.
+          3. Dispatch ArrowDown + Enter → Chrome Password Manager autoselecciona
+             la primera sugerencia (que por comportamiento nativo de Chrome
+             coincide con el email mostrado en la pantalla previa).
+          4. Verificar que el campo se llenó (pwd_len > 0); si no → password_not_saved.
+          5. Click en botón "Siguiente" por CDP.
+          6. Esperar redirect a labs.google.
+
+        Lanza Veo3LoginError con código clasificado ante cualquier fallo.
+        expected_email se usa solo para logging / futuro match si Chrome cambia
+        el orden de sugerencias; el dropdown nativo de Chrome no es parte del DOM.
         """
-        # Esperar carga de la página
+        # 1. Esperar el input con timeout duro de 10s (KISS, sin polling defensivo)
+        has_pwd = False
         for _ in range(10):
-            has_pwd = self.evaluate("document.readyState === 'complete' && !!document.querySelector('input[name=\"Passwd\"]')")
+            has_pwd = bool(self.evaluate(
+                "document.readyState === 'complete' && "
+                "!!document.querySelector('input[name=\"Passwd\"]')"
+            ))
             if has_pwd:
                 break
             time.sleep(1)
-        time.sleep(1)
 
-        # Coordenadas del campo
-        pwd_coords = self._get_screen_coords('input[name="Passwd"]')
-        if not pwd_coords:
-            pwd_coords = self._get_screen_coords('input[type="password"]')
-        if not pwd_coords:
-            log_warn("No se encontró campo de contraseña")
-            return False
+        if not has_pwd:
+            raise Veo3LoginError(
+                "password_input_not_found",
+                f"input[name='Passwd'] no apareció en 10s (email esperado={expected_email or '?'})",
+            )
 
-        # Click real en campo password
-        self._send_raw("Page.bringToFront")
-        time.sleep(0.3)
-        os_click(pwd_coords["screen_cx"], pwd_coords["screen_cy"])
-        time.sleep(2)
-
-        # Click en tooltip DiCloak (debajo del campo)
-        pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
-        if not pwd_len or int(pwd_len) == 0:
-            os_click(pwd_coords["screen_cx"], pwd_coords["screen_bottom"] + 25)
-            time.sleep(2)
-            pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"]')?.value.length || 0")
-
-        if not pwd_len or int(pwd_len) == 0:
-            log_warn("No se pudo activar autofill de DiCloak")
-            return False
-
-        log_ok(f"Password autofill ({pwd_len} chars)")
-
-        # 3. Click en Siguiente via CDP
-        clicked_next = self.evaluate("""(() => {
-            const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-            const next = btns.find(b => {
-                const t = (b.innerText || '').toLowerCase();
-                return t.includes('next') || t.includes('siguiente') || t.includes('continuar');
-            });
-            if (next) { next.click(); return next.innerText.trim(); }
-            return null;
+        # 2. Focus en el campo (necesario para que el password manager de Chrome
+        # considere abrir su dropdown de sugerencias nativo).
+        self.evaluate("""(() => {
+            const pwd = document.querySelector('input[name="Passwd"]');
+            if (pwd) { pwd.focus(); pwd.click(); }
         })()""")
-        if clicked_next:
-            log_info(f"Click CDP en '{clicked_next}'")
-            # Esperar a que navegue
-            time.sleep(5)
+        time.sleep(0.5)
 
-        return True
+        # 3. ArrowDown(x2) → abre el dropdown nativo de Chrome Password Manager
+        #    y se asegura de resaltar la primera sugerencia. Algunas builds de
+        #    Chrome solo abren el dropdown con el primer ArrowDown sin resaltar
+        #    nada; el segundo confirma la primera entrada como activa.
+        #    Usamos rawKeyDown para teclas de control (CDP responde mejor que
+        #    keyDown para navegación que no genera 'char' events).
+        for _ in range(2):
+            self._send_raw("Input.dispatchKeyEvent", {
+                "type": "rawKeyDown", "key": "ArrowDown", "code": "ArrowDown",
+                "windowsVirtualKeyCode": 40, "nativeVirtualKeyCode": 40,
+            })
+            self._send_raw("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "ArrowDown", "code": "ArrowDown",
+                "windowsVirtualKeyCode": 40, "nativeVirtualKeyCode": 40,
+            })
+            time.sleep(0.3)
+
+        # Espera larga para que el dropdown nativo termine de hidratar la
+        # selección resaltada. 0.8s no era suficiente — captura del usuario
+        # mostraba dropdown abierto pero Enter llegaba antes de la hidratación.
+        time.sleep(1.5)
+
+        # Refocus del input antes del Enter — el dropdown nativo es un overlay
+        # OS-level fuera del DOM y puede haberse llevado el foco efectivo. Si
+        # el Enter llega al overlay sin foco en el input, Chrome no commitea
+        # el autofill al campo.
+        self.evaluate("""(() => {
+            const pwd = document.querySelector('input[name="Passwd"]');
+            if (pwd) pwd.focus();
+        })()""")
+        time.sleep(0.2)
+
+        self._send_raw("Input.dispatchKeyEvent", {
+            "type": "rawKeyDown", "key": "Enter", "code": "Enter",
+            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+        })
+        self._send_raw("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": "Enter", "code": "Enter",
+            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
+        })
+
+        # 4. Verificar que el password manager efectivamente llenó el campo.
+        #    Damos hasta 3s para que Chrome propague el autofill al input.
+        pwd_len = 0
+        for _ in range(6):
+            time.sleep(0.5)
+            raw = self.evaluate(
+                "document.querySelector('input[name=\"Passwd\"]')?.value.length || 0"
+            )
+            try:
+                pwd_len = int(raw or 0)
+            except (TypeError, ValueError):
+                pwd_len = 0
+            if pwd_len > 0:
+                break
+
+        if pwd_len == 0:
+            # Nota: el Enter dispatchado arriba PUDO haber sido consumido por el
+            # formulario (submit con campo vacío). En ese caso Google mostrará
+            # error "enter a password" — igualmente clasificamos como not_saved
+            # porque la causa raíz es que Chrome no tenía credencial guardada.
+            raise Veo3LoginError(
+                "password_not_saved",
+                f"Chrome Password Manager no rellenó la contraseña para {expected_email or '?'}",
+            )
+
+        log_ok(f"Password autofill via CDP keyboard ({pwd_len} chars)")
+
+        # Settle determinista: tras confirmar value.length>0, Google necesita
+        # ~500-800ms para hidratar el estado del botón Siguiente de
+        # aria-disabled=true → habilitado. 1s es conservador y determinista.
+        time.sleep(1.0)
+
+        # 5. Click en "Siguiente / Next / Continuar" via CDP.
+        #
+        #    Selector basado en el HTML real del botón enviado por el usuario:
+        #    <button jsname="LgbsSe" jscontroller="soHxf" type="button">
+        #      <div></div><div></div><div></div>
+        #      <span jsname="V67aGc">Siguiente</span>
+        #    </button>
+        #
+        #    REGLAS ESTRICTAS (anti bug wrapper contenedor):
+        #      - SOLO <button> (tagName === 'BUTTON'). No divs. No [role="button"].
+        #      - Texto canónico = SOLO el <span jsname="V67aGc"> interior, o en su
+        #        defecto los text nodes DIRECTOS del button (sin recursión). Jamás
+        #        innerText/textContent del button (incluyen hijos descendentes y
+        #        contaminan con "¿Olvidaste la contraseña?" cuando el matcheo
+        #        devolvió un wrapper padre).
+        #      - Igualdad EXACTA contra WANTED — nada de includes/startsWith.
+        #      - Validación de tamaño: un botón MDC real mide ~40-300 x 20-80.
+        #        Un wrapper contenedor del modal es mucho mayor → rechazado.
+        #      - Sin fallbacks permisivos. Si nada matchea → null → fail limpio.
+        #      - Si hay múltiples candidatos, preferir el más abajo-derecha:
+        #        el botón "Siguiente" de Google siempre está en la esquina
+        #        inferior derecha del modal (el link "¿Olvidaste?" va a la izq).
+        log_ok("Buscando boton 'Siguiente' (match exacto span V67aGc, sin fallbacks permisivos)")
+        btn_info = self.evaluate("""(() => {
+            const norm = (s) => (s || '')
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, ' ')
+                .trim();
+            const WANTED = ['next', 'siguiente', 'continuar', 'continue'];
+            // Defensa: cualquier button cuyo innerText crudo contenga una de
+            // estas palabras es un WRAPPER contaminado (contiene el link de
+            // "¿Olvidaste la contraseña?" u otra acción secundaria). Rechazo
+            // duro — el selector continuará con el siguiente candidato.
+            const BLACKLIST = ['olvidaste', 'forgot', 'help', 'ayuda',
+                               'cancel', 'cancelar', 'atras', 'back'];
+
+            // Texto canónico del botón: span jsname="V67aGc" si existe,
+            // si no, text nodes DIRECTOS (no recursivos) del button.
+            const cleanTextOf = (btn) => {
+                const span = btn.querySelector(':scope > span[jsname="V67aGc"]');
+                if (span) return (span.textContent || '').trim();
+                const direct = Array.from(btn.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.nodeValue || '')
+                    .join('')
+                    .trim();
+                return direct;
+            };
+
+            // innerText crudo (recursivo) — SOLO para detectar contaminación
+            // (blacklist + multi-línea). Nunca se usa como label del click.
+            const rawInnerTextOf = (btn) => (btn.innerText || '').toLowerCase();
+
+            const isContaminated = (btn) => {
+                const raw = rawInnerTextOf(btn);
+                if (!raw) return false;
+                // Multi-acción: el button real MDC de Google nunca tiene \\n.
+                if (raw.split('\\n').length > 1) return true;
+                // Blacklist: wrapper que incluye acciones secundarias.
+                for (const w of BLACKLIST) {
+                    if (raw.includes(w)) return true;
+                }
+                return false;
+            };
+
+            const isVisibleEnabled = (btn) => {
+                if (!btn) return false;
+                if (btn.tagName !== 'BUTTON') return false;
+                if (btn.offsetParent === null) return false;
+                if (btn.disabled === true) return false;
+                if (btn.getAttribute('aria-disabled') === 'true') return false;
+                return true;
+            };
+
+            const describe = (btn, cleanText, priority) => {
+                btn.scrollIntoView({block: 'center', inline: 'center'});
+                const r = btn.getBoundingClientRect();
+                const w = Math.round(r.width);
+                const h = Math.round(r.height);
+                // Tamaño razonable de un MDC button (no un wrapper contenedor).
+                if (w < 40 || w > 300) return null;
+                if (h < 20 || h > 80) return null;
+                const rawInner = (btn.innerText || '').trim();
+                return {
+                    cx: Math.round(r.left + r.width / 2),
+                    cy: Math.round(r.top + r.height / 2),
+                    left: Math.round(r.left),
+                    top: Math.round(r.top),
+                    width: w,
+                    height: h,
+                    label: cleanText.slice(0, 40),
+                    span_text: cleanText.slice(0, 60),
+                    inner_text: rawInner.slice(0, 80).replace(/\\n/g, ' | '),
+                    tag: btn.tagName,
+                    jsname: btn.getAttribute('jsname') || '',
+                    jscontroller: btn.getAttribute('jscontroller') || '',
+                    priority: priority,
+                };
+            };
+
+            const candidates = [];
+
+            const rejected = [];  // diagnóstico de por qué descartamos
+
+            // Prioridad 1: <button> con texto exacto en span V67aGc o text nodes directos.
+            for (const b of document.querySelectorAll('button')) {
+                if (!isVisibleEnabled(b)) continue;
+                const clean = cleanTextOf(b);
+                if (!clean) continue;
+                const n = norm(clean);
+                if (!WANTED.includes(n)) continue;  // IGUALDAD EXACTA
+                if (isContaminated(b)) {
+                    rejected.push({
+                        why: 'contaminated',
+                        span_text: clean.slice(0, 40),
+                        inner_text: (b.innerText || '').trim().slice(0, 80).replace(/\\n/g, ' | '),
+                    });
+                    continue;
+                }
+                const info = describe(b, clean, 1);
+                if (info) candidates.push(info);
+            }
+
+            // Prioridad 2: span[jsname="V67aGc"] con texto exacto → su button ancestro.
+            if (candidates.length === 0) {
+                const seen = new Set();
+                for (const span of document.querySelectorAll('button > span[jsname="V67aGc"]')) {
+                    const btn = span.closest('button');
+                    if (!btn || seen.has(btn)) continue;
+                    seen.add(btn);
+                    if (!isVisibleEnabled(btn)) continue;
+                    const clean = (span.textContent || '').trim();
+                    if (!clean) continue;
+                    const n = norm(clean);
+                    if (!WANTED.includes(n)) continue;  // IGUALDAD EXACTA
+                    if (isContaminated(btn)) {
+                        rejected.push({
+                            why: 'contaminated',
+                            span_text: clean.slice(0, 40),
+                            inner_text: (btn.innerText || '').trim().slice(0, 80).replace(/\\n/g, ' | '),
+                        });
+                        continue;
+                    }
+                    const info = describe(btn, clean, 2);
+                    if (info) candidates.push(info);
+                }
+            }
+
+            // NO hay prioridad 3. Sin fallback por [role="button"] / includes.
+
+            if (candidates.length === 0) {
+                // Diagnóstico: primeros 5 textos de buttons visibles para debug.
+                const visibleBtns = Array.from(document.querySelectorAll('button'))
+                    .filter(b => b.offsetParent !== null);
+                const firstTexts = visibleBtns.slice(0, 5).map(b => {
+                    const c = cleanTextOf(b);
+                    return c.slice(0, 30);
+                });
+                return JSON.stringify({
+                    found: false,
+                    visible_buttons: visibleBtns.length,
+                    first_texts: firstTexts,
+                    rejected: rejected,
+                });
+            }
+
+            // Ranking: preferir más a la derecha y más abajo
+            // (botón Siguiente siempre en esquina inf-derecha del modal).
+            candidates.sort((a, b) => {
+                const sa = a.left + a.top * 0.5;
+                const sb = b.left + b.top * 0.5;
+                return sb - sa;
+            });
+
+            return JSON.stringify({
+                found: true,
+                winner: candidates[0],
+                all: candidates.map(c => ({
+                    label: c.label, jsname: c.jsname, cx: c.cx, cy: c.cy,
+                    w: c.width, h: c.height, prio: c.priority,
+                })),
+                rejected: rejected,
+            });
+        })()""")
+
+        # Parseo del resultado. El selector devuelve SIEMPRE JSON con
+        # {found: bool, ...}. null solo si evaluate() falló a nivel CDP.
+        parsed = None
+        if btn_info and btn_info != "null":
+            try:
+                parsed = json.loads(btn_info)
+            except Exception as exc:
+                raise Veo3LoginError(
+                    "next_button_click_failed",
+                    f"No se pudo parsear respuesta del selector Siguiente: {exc}",
+                ) from exc
+
+        if not parsed or not parsed.get("found"):
+            visible_count = 0
+            first_texts: list = []
+            if parsed:
+                visible_count = parsed.get("visible_buttons", 0)
+                first_texts = parsed.get("first_texts", [])
+            # Puede ser que la página ya navegó (Enter en paso 3 hizo submit).
+            still_here = self.evaluate(
+                "!!document.querySelector('input[name=\"Passwd\"]') && "
+                "(window.location.href || '').toLowerCase().includes('accounts.google.com')"
+            )
+            rejected = parsed.get("rejected", []) if parsed else []
+            log_warn(
+                f"Siguiente no encontrado. Total buttons visibles: {visible_count}. "
+                f"Textos: {first_texts}. Rechazados: {rejected}"
+            )
+            if still_here:
+                raise Veo3LoginError(
+                    "next_button_not_found",
+                    "Password autofilleado pero no se encontró botón Siguiente/Next",
+                )
+            log_info("Botón Siguiente no hallado pero página ya navegó — OK")
+        else:
+            info = parsed["winner"]
+            cx = int(info["cx"])
+            cy = int(info["cy"])
+            label = info.get("label", "")
+            span_text = info.get("span_text", "")
+            inner_text = info.get("inner_text", "")
+            width = info.get("width", 0)
+            height = info.get("height", 0)
+            tag = info.get("tag", "")
+            jsname_attr = info.get("jsname", "")
+            priority = info.get("priority", 0)
+
+            all_cands = parsed.get("all", [])
+            if len(all_cands) > 1:
+                log_info(f"Candidatos Siguiente: {json.dumps(all_cands)}")
+            rejected_cands = parsed.get("rejected", [])
+            if rejected_cands:
+                log_info(f"Candidatos rechazados por contaminacion: {json.dumps(rejected_cands)}")
+
+            log_ok(
+                f"Boton encontrado (prio={priority}): tag={tag} jsname={jsname_attr} "
+                f"span_text='{span_text}' inner_text='{inner_text}' "
+                f"rect=({cx},{cy}) size={width}x{height}"
+            )
+
+            # Click físico real via CDP: mousePressed + mouseReleased sobre el
+            # centro del botón. Dispara mousedown/mouseup/click en el orden
+            # correcto — necesario para botones Google que escuchan mousedown.
+            log_ok(f"Click CDP mousePressed en ({cx},{cy})")
+            press = self._send_raw("Input.dispatchMouseEvent", {
+                "type": "mousePressed", "x": cx, "y": cy,
+                "button": "left", "clickCount": 1,
+            })
+            release = self._send_raw("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "x": cx, "y": cy,
+                "button": "left", "clickCount": 1,
+            })
+            if press is None or release is None:
+                log_error(f"dispatchMouseEvent fallo al clickear ({cx},{cy})")
+                raise Veo3LoginError(
+                    "next_button_click_failed",
+                    f"CDP dispatchMouseEvent falló sobre botón '{label}' en ({cx},{cy})",
+                )
+            log_ok("Click CDP mouseReleased disparado, esperando navegacion")
+
+        # 6. Esperar redirect fuera de accounts.google.com (hasta 15s).
+        for _ in range(15):
+            time.sleep(1)
+            url_now = (self.evaluate("window.location.href") or "").lower()
+            if url_now and "accounts.google.com" not in url_now:
+                log_ok(f"Password flow OK → {url_now[:60]}")
+                return True
+
+        raise Veo3LoginError(
+            "google_flow_redirect_timeout",
+            "Tras click en Siguiente, Google no redirigió fuera de accounts.google.com en 15s",
+        )
 
     def _send_raw(self, method: str, params: dict | None = None) -> dict | None:
         """Envía comando CDP raw sin wrapper de evaluate."""
@@ -423,34 +1073,144 @@ class Veo3Session:
 # ── Función principal ────────────────────────────────────────────────────────
 
 def _cleanup_tabs(port: int) -> str:
-    """Cierra todos los tabs excepto uno y retorna el WebSocket del tab que queda."""
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as resp:
-            targets = json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    """DEPRECATED wrapper — ahora delega al selector con prioridad.
+
+    Mantenido para compatibilidad con navigate_and_stabilize. Selecciona
+    el tab correcto (Flow > accounts.google > otro > createTarget) y cierra
+    los demás. Retorna el webSocketDebuggerUrl del tab elegido.
+    """
+    tmp = Veo3Session(port=port)
+    selected = tmp._select_or_create_flow_tab()
+    if not selected:
+        log_warn(f"Sin tabs en puerto {port}")
         return ""
+    keep_id = selected.get("id", "")
+    if keep_id:
+        tmp._close_other_tabs(keep_id)
+    return selected.get("webSocketDebuggerUrl", "")
 
-    pages = [t for t in targets if t.get("type") == "page"]
-    log_info(f"Tabs abiertos: {len(pages)}. Limpiando...")
 
-    if not pages:
-        return ""
+def _ensure_on_flow(session: Veo3Session) -> dict:
+    """Garantiza que la sesión termine en labs.google/fx (sesión activa).
 
-    # Mantener solo el primer tab
-    keep = pages[0]
-    for tab in pages[1:]:
-        tab_id = tab.get("id", "")
-        if tab_id:
+    Flujo (KISS, sin retries, sin polling defensivo, timeouts duros):
+      1. Navegar a VEO3_URL.
+      2. wait_for_page_load (20s hard timeout).
+      3. detect_page_state:
+         - 'flow'            → OK, continuar.
+         - 'account_chooser' → click en primera cuenta, esperar carga,
+                                recursión única: si cae en 'password',
+                                _handle_password_page; si cae en 'flow', OK.
+         - 'password'        → _handle_password_page directamente.
+         - 'sign_in'         → error 'login_state_unknown' (no hay flujo
+                                de email+password implementado aquí; ese
+                                camino lo cubre el login manual o una
+                                iteración futura).
+         - 'unknown'         → error 'login_state_unknown'.
+
+    Retorna dict con 'success' bool y 'error' (código clasificado) en caso
+    de fallo. Propaga códigos de Veo3LoginError.
+    """
+    # Early-return: si la pestaña actual YA está en Flow (sesión activa,
+    # ej. perfil abierto en labs.google/fx/tools/flow/project/xxx), NO
+    # navegar — la navigate a la home puede tirar al perfil al login flow
+    # innecesariamente y marcar el perfil como expired aunque sea válido.
+    # Importante: verificar con detect_page_state que NO sea landing
+    # (flow_signin_prompt) — la URL puede ser labs.google/fx pero tener
+    # el botón "Sign in with Google" visible (sesión NO activa).
+    current_url = (session.evaluate("window.location.href") or "").lower()
+    if "labs.google/fx" in current_url and "accounts.google" not in current_url:
+        current_state = session.detect_page_state()
+        if current_state.get("state") == "flow":
+            log_ok(f"Sesión activa detectada sin navegar — url={current_url[:80]}")
+            return {"success": True}
+        log_info(
+            f"URL Flow pero estado={current_state.get('state')} — procediendo con login flow"
+        )
+
+    log_info(f"Navegando a {VEO3_URL}...")
+    session.navigate(VEO3_URL)
+
+    if not session.wait_for_page_load(timeout_sec=20):
+        return {"success": False, "error": "page_load_timeout",
+                "details": "document.readyState no llegó a 'complete' en 20s"}
+
+    state = session.detect_page_state()
+    log_info(f"Estado detectado: {state.get('state')} url={state.get('url', '')[:80]}")
+
+    if state["state"] == "flow":
+        log_ok("Sesión activa — ya en Flow")
+        return {"success": True}
+
+    if state["state"] == "flow_signin_prompt":
+        log_info("Landing de Flow detectada — click en 'Sign in with Google'")
+        try:
+            session.click_flow_signin_button()
+        except Veo3LoginError as exc:
+            return {"success": False, "error": exc.code, "details": str(exc)}
+
+        if not session.wait_for_page_load(timeout_sec=20):
+            return {"success": False, "error": "page_load_timeout",
+                    "details": "Post-click flow_signin: readyState no completó"}
+
+        # Re-clasificar: debería caer en account_chooser (mayoría) o password
+        # o flow (si Google reusa sesión silenciosamente).
+        state = session.detect_page_state()
+        log_info(f"Estado post flow_signin: {state.get('state')} url={state.get('url', '')[:80]}")
+
+        if state["state"] == "flow":
+            log_ok("Sesión activa tras click en Sign in")
+            return {"success": True}
+        # Si no es flow, cae natural en los dispatches de abajo
+        # (account_chooser / password / sign_in / unknown).
+
+    if state["state"] == "account_chooser":
+        if state.get("identifier_count", 0) == 0:
+            return {"success": False, "error": "account_chooser_no_accounts",
+                    "details": "Pantalla account chooser sin [data-identifier]"}
+        email = session.click_account_chooser()
+        log_info(f"Click en cuenta del chooser: {email}")
+
+        # Esperar a que la navegación post-click termine.
+        if not session.wait_for_page_load(timeout_sec=20):
+            return {"success": False, "error": "page_load_timeout",
+                    "details": "Post-click account chooser: readyState no completó"}
+
+        state2 = session.detect_page_state()
+        log_info(f"Estado post-click: {state2.get('state')}")
+
+        if state2["state"] == "flow":
+            return {"success": True}
+        if state2["state"] == "password":
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}/json/close/{tab_id}", timeout=3)
-            except Exception:
-                pass
+                session._handle_password_page(expected_email=email.lower())
+            except Veo3LoginError as exc:
+                return {"success": False, "error": exc.code, "details": str(exc)}
+            # Tras password_page, _handle_password_page ya esperó redirect
+            # fuera de accounts.google — asumimos Flow (wait_for_page_load
+            # por seguridad).
+            session.wait_for_page_load(timeout_sec=15)
+            if session.is_on_flow():
+                return {"success": True}
+            return {"success": False, "error": "google_flow_redirect_timeout",
+                    "details": "Password OK pero no aterrizó en Flow"}
 
-    closed = len(pages) - 1
-    if closed > 0:
-        log_ok(f"{closed} tab(s) cerrado(s). Queda 1 tab activo.")
+        return {"success": False, "error": "login_state_unknown",
+                "details": f"Post account_chooser: state={state2.get('state')}"}
 
-    return keep.get("webSocketDebuggerUrl", "")
+    if state["state"] == "password":
+        try:
+            session._handle_password_page(expected_email="")
+        except Veo3LoginError as exc:
+            return {"success": False, "error": exc.code, "details": str(exc)}
+        session.wait_for_page_load(timeout_sec=15)
+        if session.is_on_flow():
+            return {"success": True}
+        return {"success": False, "error": "google_flow_redirect_timeout",
+                "details": "Password OK pero no aterrizó en Flow"}
+
+    return {"success": False, "error": "login_state_unknown",
+            "details": f"state={state.get('state')} url={state.get('url', '')[:120]}"}
 
 
 def open_new_project(port: int, prompt: str = "") -> dict:
@@ -459,11 +1219,28 @@ def open_new_project(port: int, prompt: str = "") -> dict:
     if not session.connect():
         return {"success": False, "error": f"No se pudo conectar en puerto {port}"}
 
+    # Buffer de logs del proceso de login, re-emitido al cliente HTTP via
+    # campo 'login_logs' para que aparezca en el log del caller (Huey), sin
+    # necesidad de mirar el stdout del server-dicloak.
+    login_logs: list[str] = []
     try:
-        # Verificar que estamos en Flow
+        # Navegar y garantizar Flow (sesión activa, account_chooser, o password).
         if not session.is_on_flow():
-            url = session.evaluate("window.location.href") or ""
-            return {"success": False, "error": "No está en Flow", "url": url}
+            with capture_logs() as _buf:
+                try:
+                    ensured = _ensure_on_flow(session)
+                finally:
+                    login_logs = list(_buf)
+            if not ensured.get("success"):
+                return {
+                    "success": False,
+                    "error": ensured.get("error", "no_flow"),
+                    "details": ensured.get("details", ""),
+                    "url": session.evaluate("window.location.href") or "",
+                    "login_logs": login_logs,
+                }
+            # Un pequeño settle tras login para que Flow termine de hidratar.
+            time.sleep(2)
 
         # Click en "New project"
         result = session.evaluate("""(() => {
@@ -511,6 +1288,7 @@ def open_new_project(port: int, prompt: str = "") -> dict:
                 "needs_account_switch": True,
                 "port": port,
                 "url": project_url or url,
+                "login_logs": login_logs,
             }
 
         return {
@@ -519,6 +1297,7 @@ def open_new_project(port: int, prompt: str = "") -> dict:
             "url": project_url or url,
             "title": title,
             "prompt_sent": prompt_sent,
+            "login_logs": login_logs,
         }
 
     finally:
@@ -1122,16 +1901,13 @@ def navigate_and_stabilize(port: int, timeout: int = 60) -> dict:
     """
     deadline = time.time() + timeout
 
-    # 1. Limpiar tabs duplicados
-    ws_url = _cleanup_tabs(port)
-    if not ws_url:
-        return {"success": False, "error": f"No hay tabs en puerto {port}"}
-
-    time.sleep(1)
-
+    # 1. Conectar — connect() ya selecciona el tab correcto (Flow >
+    #    accounts.google > otro > createTarget) y cierra los demás.
     session = Veo3Session(port=port)
     if not session.connect():
         return {"success": False, "error": f"No se pudo conectar en puerto {port}"}
+
+    time.sleep(1)
 
     try:
         # 2. Verificar estabilidad

@@ -643,7 +643,15 @@ def veo3_new_project(req: Veo3NewProjectRequest):
         result = open_new_project(port=req.port, prompt=req.prompt)
         if result.get("success"):
             return success_response(data=result, message="Nuevo proyecto abierto en Flow")
-        return error_response(result.get("error", "Error desconocido"), 500)
+        # Propagar error clasificado en 'details' para que el cliente Python
+        # pueda leer el code (page_load_timeout, account_chooser_no_accounts,
+        # password_input_not_found, password_not_saved, next_button_not_found,
+        # google_flow_redirect_timeout, login_state_unknown, etc.)
+        return error_response(
+            result.get("error", "Error desconocido"),
+            500,
+            details={"error": result.get("error", ""), **result},
+        )
     except Exception as e:
         return error_response(str(e), 500)
 
