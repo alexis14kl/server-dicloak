@@ -505,7 +505,8 @@ def _download_video_from_page(session: Veo3Session, output_dir: str = "") -> str
     3. Descargar via urllib con cookies httpOnly del browser
     """
     import re
-    import urllib.request as _urllib_request
+
+    import httpx
 
     out_dir = Path(output_dir) if output_dir else DEFAULT_VIDEO_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -586,28 +587,85 @@ def _download_video_from_page(session: Veo3Session, output_dir: str = "") -> str
     video_id = match.group(1)[:12] if match else f"veo_{int(time.time())}"
     output_path = out_dir / f"{ts}_{video_id}.mp4"
 
+    # Convertir string de cookies "k=v; k=v" a dict para httpx
+    cookies_dict: dict[str, str] = {}
+    for part in cookies.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        cookies_dict[k.strip()] = v.strip()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+        "Referer": "https://labs.google/",
+    }
+
+    # verify=False: decision consciente. En macOS el truststore por defecto de
+    # Python no resuelve el cert del CDN de media.googleusercontent (usado tras
+    # el redirect de labs.google/fx/api/trpc/media.getMediaUrlRedirect) y el
+    # download casca con SSL: CERTIFICATE_VERIFY_FAILED. Es media publica de
+    # Google Labs, no banca: aceptable desactivar verificacion aqui.
+    timeout = httpx.Timeout(180.0, connect=10.0)
+
     for attempt in range(1, 4):
         log_info(f"[DESCARGA] Intento {attempt}/3...")
         try:
-            req = _urllib_request.Request(video_url, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
-                "Cookie": cookies,
-                "Referer": "https://labs.google/",
-            })
-            with _urllib_request.urlopen(req, timeout=180) as resp:
-                video_bytes = resp.read()
+            with httpx.Client(
+                verify=False,
+                follow_redirects=True,
+                timeout=timeout,
+                cookies=cookies_dict,
+                headers=headers,
+            ) as client:
+                with client.stream("GET", video_url) as resp:
+                    status = resp.status_code
+                    content_length = resp.headers.get("content-length", "?")
+                    if status != 200:
+                        log_warn(
+                            f"[DESCARGA] Intento {attempt}/3 fallo: status={status} "
+                            f"content-length={content_length}"
+                        )
+                        time.sleep(3)
+                        continue
 
-            if len(video_bytes) < 100_000:
-                log_warn(f"[DESCARGA] Intento {attempt}/3: archivo muy pequeno ({len(video_bytes)} bytes)")
+                    written = 0
+                    with output_path.open("wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                                written += len(chunk)
+
+            if written < 100_000:
+                log_warn(
+                    f"[DESCARGA] Intento {attempt}/3: archivo muy pequeno "
+                    f"({written} bytes, content-length={content_length})"
+                )
+                try:
+                    output_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 time.sleep(3)
                 continue
 
-            output_path.write_bytes(video_bytes)
-            size_mb = len(video_bytes) / (1024 * 1024)
-            log_ok(f"[DESCARGA] Video descargado: {output_path.name} ({size_mb:.1f}MB)")
+            size_mb = written / (1024 * 1024)
+            log_ok(
+                f"[DESCARGA] Intento {attempt}/3 -> status={status} "
+                f"content-length={content_length} -> escritos {written} bytes "
+                f"en {output_path} ({size_mb:.1f}MB)"
+            )
             return str(output_path)
 
+        except httpx.HTTPStatusError as e:
+            log_warn(
+                f"[DESCARGA] Intento {attempt}/3 fallo HTTPStatusError: "
+                f"status={e.response.status_code} {e}"
+            )
+            time.sleep(3)
+        except httpx.RequestError as e:
+            log_warn(f"[DESCARGA] Intento {attempt}/3 fallo RequestError: {e}")
+            time.sleep(3)
         except Exception as e:
             log_warn(f"[DESCARGA] Intento {attempt}/3 fallo: {e}")
             time.sleep(3)
