@@ -337,6 +337,7 @@ class PromptRequest(BaseModel):
     timeout: int = 120
     auto_rotate: bool = True
     paste_only: bool = False
+    new_conversation: bool = False  # Si True, navega a chatgpt.com antes del prompt (nueva sesión)
 
     @field_validator("prompt")
     @classmethod
@@ -568,6 +569,42 @@ def chatgpt_prompt(req: PromptRequest):
                 log_info(f"Stabilize: {closed} tabs cerradas antes del prompt")
         except Exception as e:
             log_warn(f"Stabilize fallo (no critico): {e}")
+
+        # Si es una nueva sesión (no corrección), hacer click en el botón "Nuevo chat"
+        # de ChatGPT para iniciar una conversación limpia sin mezclar contextos.
+        # Se usa CDP sobre la tab activa — no se navega ni se recarga la página.
+        if req.new_conversation:
+            try:
+                import time as _time
+                from chat_gpt_consulta.prompt_paste import ChatGPTSession
+                import websockets.sync.client as _ws_sync
+
+                _nc_session = ChatGPTSession(port=port)
+                if tab_ws:
+                    _nc_session.ws_url = tab_ws
+                    _nc_session._ws = _ws_sync.connect(tab_ws, max_size=2**22)
+                else:
+                    _nc_session.connect()
+
+                clicked = _nc_session.evaluate("""(() => {
+                    const btn = document.querySelector('[data-testid="create-new-chat-button"]')
+                        || document.querySelector('a[href="/"]')
+                        || document.querySelector('button[aria-label="New chat"]')
+                        || document.querySelector('button[aria-label="Nuevo chat"]');
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                })()""")
+
+                if clicked:
+                    log_info("new_conversation: click en 'Nuevo chat' realizado")
+                    _time.sleep(3)  # Esperar que el DOM del chat vacío cargue
+                else:
+                    log_warn("new_conversation: no se encontró botón 'Nuevo chat', continuando igual")
+
+                _nc_session.close()
+                tab_ws = ""  # Reconectar a la tab actualizada tras el click
+            except Exception as e:
+                log_warn(f"new_conversation: fallo al crear nuevo chat (no critico): {e}")
 
         if req.paste_only:
             from chat_gpt_consulta.prompt_paste import paste_prompt_only
