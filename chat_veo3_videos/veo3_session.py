@@ -11,7 +11,6 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 
-
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logger import log_info, log_ok, log_warn, log_error, capture_logs
@@ -23,15 +22,6 @@ from platform_utils import (
 
 VEO3_URL = "https://labs.google/fx/tools/flow"
 VIDEO_FX_URL = "https://labs.google/fx/tools/video-fx"
-
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from logger import log_info, log_ok, log_warn, log_error
-
-
-VEO3_URL = "https://labs.google/fx/tools/flow"
-VIDEO_FX_URL = "https://labs.google/fx/tools/video-fx"
-
 
 
 # ── Errores clasificados del flujo de login ────────────────────────────────
@@ -610,7 +600,6 @@ class Veo3Session:
         log_error("No se pudo completar el login de Google")
         return False
 
-
     def _get_screen_coords(self, selector: str) -> dict | None:
         """Obtiene coordenadas absolutas de pantalla de un elemento DOM.
         Necesario para OS clicks que activan el autofill nativo de DiCloak.
@@ -678,181 +667,6 @@ class Veo3Session:
         self.evaluate("""(() => {
             const pwd = document.querySelector('input[name="Passwd"]');
             if (pwd) { pwd.focus(); pwd.click(); }
-=======
-    def _get_client_coords(self, selector: str) -> dict | None:
-        """Obtiene coordenadas del viewport para clicks virtuales CDP."""
-        result = self.evaluate(f"""(() => {{
-            const el = document.querySelector('{selector}');
-            if (!el) return null;
-            const rect = el.getBoundingClientRect();
-            return JSON.stringify({{
-                cx: rect.x + rect.width / 2,
-                cy: rect.y + rect.height / 2,
-            }});
-        }})()""")
-        if not result:
-            return None
-        try:
-            return json.loads(result)
-        except Exception:
-            return None
-
-    def _cdp_click(self, x: float, y: float):
-        """Click virtual via CDP sin mover el cursor del usuario."""
-        for event_type in ("mouseMoved", "mousePressed", "mouseReleased"):
-            self._send_raw("Input.dispatchMouseEvent", {
-                "type": event_type,
-                "x": x,
-                "y": y,
-                "button": "left",
-                "clickCount": 1,
-            })
-            time.sleep(0.04)
-
-    def _send_strong_key(self, key: str, code: str, vk: int):
-        """Envía una tecla con rawKeyDown+keyDown+keyUp para popups nativos."""
-        params = {
-            "key": key,
-            "code": code,
-            "windowsVirtualKeyCode": vk,
-            "nativeVirtualKeyCode": vk,
-        }
-        self._send_raw("Input.dispatchKeyEvent", {"type": "rawKeyDown", **params})
-        time.sleep(0.04)
-        self._send_raw("Input.dispatchKeyEvent", {"type": "keyDown", **params})
-        time.sleep(0.04)
-        self._send_raw("Input.dispatchKeyEvent", {"type": "keyUp", **params})
-        time.sleep(0.22)
-
-    def _handle_password_page(self) -> bool:
-        """Activa autofill de DiCloak en página de contraseña de Google.
-        Flujo validado: click virtual al input → ArrowDown fuerte → Enter fuerte.
-        """
-        # Esperar carga de la página
-        for _ in range(10):
-            has_pwd = bool(self.evaluate(
-                "document.readyState === 'complete' && "
-                "!!document.querySelector('input[name=\"Passwd\"], input[type=\"password\"]')"
-            ))
-            if has_pwd:
-                break
-            time.sleep(0.6)
-
-        # Coordenadas del campo para click virtual
-        pwd_coords = self._get_client_coords('input[name="Passwd"]')
-        if not pwd_coords:
-            pwd_coords = self._get_client_coords('input[type="password"]')
-        if not pwd_coords:
-            log_warn("No se encontró campo de contraseña")
-            return False
-
-        # Click virtual en el input para abrir el popup nativo de passwords
-        self._send_raw("Page.bringToFront")
-        time.sleep(0.3)
-        self._cdp_click(pwd_coords["cx"], pwd_coords["cy"])
-        time.sleep(0.3)
-        if not has_pwd:
-            raise Veo3LoginError(
-                "password_input_not_found",
-                f"input[name='Passwd'] no apareció en 10s (email esperado={expected_email or '?'})",
-            )
-
-        # 2. Focus en el campo (necesario para que el password manager de Chrome
-        # considere abrir su dropdown de sugerencias nativo).
-        self.evaluate("""(() => {
-            const pwd = document.querySelector('input[name="Passwd"]');
-            if (pwd) { pwd.focus(); pwd.click(); }
-        })()""")
-        time.sleep(0.5)
-
-        # 3. ArrowDown(x2) → abre el dropdown nativo de Chrome Password Manager
-        #    y se asegura de resaltar la primera sugerencia. Algunas builds de
-        #    Chrome solo abren el dropdown con el primer ArrowDown sin resaltar
-        #    nada; el segundo confirma la primera entrada como activa.
-        #    Usamos rawKeyDown para teclas de control (CDP responde mejor que
-        #    keyDown para navegación que no genera 'char' events).
-        for _ in range(2):
-            self._send_raw("Input.dispatchKeyEvent", {
-                "type": "rawKeyDown", "key": "ArrowDown", "code": "ArrowDown",
-                "windowsVirtualKeyCode": 40, "nativeVirtualKeyCode": 40,
-            })
-            self._send_raw("Input.dispatchKeyEvent", {
-                "type": "keyUp", "key": "ArrowDown", "code": "ArrowDown",
-                "windowsVirtualKeyCode": 40, "nativeVirtualKeyCode": 40,
-            })
-            time.sleep(0.3)
-
-        # Espera larga para que el dropdown nativo termine de hidratar la
-        # selección resaltada. 0.8s no era suficiente — captura del usuario
-        # mostraba dropdown abierto pero Enter llegaba antes de la hidratación.
-        time.sleep(1.5)
-
-        # Navegar popup nativo con teclas "fuertes"
-        self._send_strong_key("ArrowDown", "ArrowDown", 40)
-        self._send_strong_key("Enter", "Enter", 13)
-        time.sleep(0.6)
-
-        pwd_len = self.evaluate("document.querySelector('input[name=\"Passwd\"], input[type=\"password\"]')?.value.length || 0")
-
-        if not pwd_len or int(pwd_len) == 0:
-            log_warn("No se pudo activar autofill de DiCloak con click virtual + ArrowDown + Enter")
-            return False
-        # Refocus del input antes del Enter — el dropdown nativo es un overlay
-        # OS-level fuera del DOM y puede haberse llevado el foco efectivo. Si
-        # el Enter llega al overlay sin foco en el input, Chrome no commitea
-        # el autofill al campo.
-        self.evaluate("""(() => {
-            const pwd = document.querySelector('input[name="Passwd"]');
-            if (pwd) pwd.focus();
-        })()""")
-        time.sleep(0.2)
-
-        self._send_raw("Input.dispatchKeyEvent", {
-            "type": "rawKeyDown", "key": "Enter", "code": "Enter",
-            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
-        })
-        self._send_raw("Input.dispatchKeyEvent", {
-            "type": "keyUp", "key": "Enter", "code": "Enter",
-            "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
-        })
-
-        # 4. Verificar que el password manager efectivamente llenó el campo.
-        #    Damos hasta 3s para que Chrome propague el autofill al input.
-        pwd_len = 0
-        for _ in range(6):
-            time.sleep(0.5)
-            raw = self.evaluate(
-                "document.querySelector('input[name=\"Passwd\"]')?.value.length || 0"
-            )
-            try:
-                pwd_len = int(raw or 0)
-            except (TypeError, ValueError):
-                pwd_len = 0
-            if pwd_len > 0:
-                break
-
-        if pwd_len == 0:
-            # Nota: el Enter dispatchado arriba PUDO haber sido consumido por el
-            # formulario (submit con campo vacío). En ese caso Google mostrará
-            # error "enter a password" — igualmente clasificamos como not_saved
-            # porque la causa raíz es que Chrome no tenía credencial guardada.
-            raise Veo3LoginError(
-                "password_not_saved",
-                f"Chrome Password Manager no rellenó la contraseña para {expected_email or '?'}",
-            )
-
-        log_ok(f"Password autofill via CDP keyboard ({pwd_len} chars)")
-
-        # 3. Click en Siguiente via CDP
-        clicked_next = self.evaluate("""(() => {
-            const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-            const next = btns.find(b => {
-                const t = (b.innerText || '').toLowerCase();
-                return t.includes('next') || t.includes('siguiente') || t.includes('continuar');
-            });
-            if (next) { next.click(); return next.innerText.trim(); }
-            return null;
->>>>>>> origin
         })()""")
         time.sleep(0.5)
 
@@ -1457,26 +1271,6 @@ def open_new_project(port: int, prompt: str = "") -> dict:
                 break
 
         title = session.evaluate("document.title") or ""
-
-        # Esperar a que el selector de modelo aparezca (tarda unos segundos)
-        log_info("Esperando selector de modelo...")
-        for _wait in range(8):
-            selector_check = session.evaluate("""(() => {
-                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-                for (const b of btns) {
-                    if (!b.offsetParent) continue;
-                    const text = (b.innerText || '').trim().toLowerCase();
-                    const rect = b.getBoundingClientRect();
-                    if (rect.top > window.innerHeight * 0.5 && rect.width > 80
-                        && (text.includes('nano') || text.includes('banana')
-                            || text.includes('veo') || text.includes('x2') || text.includes('x1')))
-                        return 'FOUND';
-                }
-                return 'NOT_YET';
-            })()""")
-            if selector_check == "FOUND":
-                break
-            time.sleep(1)
 
         # Asegurar modo Video antes de pegar prompt
         if not ensure_video_mode(session):
