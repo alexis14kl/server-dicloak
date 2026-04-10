@@ -372,6 +372,8 @@ class Veo3DownloadVideoRequest(BaseModel):
     port: int
     timeout: int = 70
     output_dir: str = ""
+    webhook_url: str = ""
+    job_id: str = ""
 
 
 # ── Auto-launch ──────────────────────────────────────────────────────────────
@@ -702,6 +704,11 @@ def veo3_download_video(req: Veo3DownloadVideoRequest):
             output_dir=req.output_dir,
         )
         if result.get("success"):
+            # Construir video_url HTTP servible (mismo patron que imagen)
+            file_name = result.get("file_name", "")
+            if file_name:
+                result["video_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/output/videos/{file_name}"
+            _notify_video_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Video descargado")
         return error_response(result.get("error", "Error desconocido"), 500, details=result)
     except Exception as e:
@@ -763,6 +770,33 @@ def _notify_webhook(url: str, job_id: str, result: dict) -> None:
             urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"[WARN] Webhook fallo ({url}): {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _notify_video_webhook(url: str, job_id: str, result: dict) -> None:
+    """Fire-and-forget: notifica al webhook de video listo (mismo patron que _notify_webhook)."""
+    if not url:
+        return
+
+    def _send():
+        try:
+            payload = _json.dumps({
+                "job_id": job_id,
+                "event": "video_ready",
+                "file_path": result.get("file_path", ""),
+                "file_name": result.get("file_name", ""),
+                "file_size": result.get("file_size", 0),
+                "video_url": result.get("video_url", ""),
+                "duration": result.get("duration", 0),
+            }, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"[WARN] Video webhook fallo ({url}): {e}")
 
     threading.Thread(target=_send, daemon=True).start()
 
