@@ -567,8 +567,22 @@ def inject_hook():
 def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
     """Estabiliza ChatGPT: cierra tabs duplicadas, deja 1 sola lista para generar."""
     try:
+        # Auto-detectar puerto activo si el recibido murió
+        port = req.port
+        if not _test_cdp_port(port):
+            log_warn(f"[stabilize] Puerto CDP {port} no responde — buscando activo...")
+            running = service.get_running_profiles()
+            for p in running:
+                rp = p.get("debug_port", 0)
+                if rp and p.get("cdp_active"):
+                    port = rp
+                    log_ok(f"[stabilize] Puerto CDP actualizado: {port}")
+                    break
+            else:
+                return error_response(f"Puerto CDP {req.port} muerto y no se encontro reemplazo", 503)
+
         from chat_gpt_consulta.stabilize import stabilize_chatgpt
-        result = stabilize_chatgpt(port=req.port, timeout=req.timeout)
+        result = stabilize_chatgpt(port=port, timeout=req.timeout)
         if result.get("success"):
             return success_response(data=result, message=result.get("message", "ChatGPT estabilizado"))
         return error_response(result.get("error", "Error estabilizando"), 500, details=result)
