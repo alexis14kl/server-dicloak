@@ -457,6 +457,37 @@ def health():
     except Exception as e:
         return error_response(str(e), 500)
 
+
+# ─── Cancelacion cooperativa de jobs ──────────────────────────────────────
+# Publicidad llama POST /jobs/{job_id}/cancel para indicar que debe
+# abortar la operacion activa asociada a ese job. El handler solo flipea
+# una bandera en el registry en memoria — los loops internos (wait,
+# paste, download) son quienes realmente la consultan entre iteraciones.
+#
+# Respuesta inmediata (no bloquea esperando el abort real). La latencia
+# entre el flip de la bandera y el aborto efectivo es de 1-3s (el tiempo
+# del siguiente checkpoint en los loops). Esto es aceptable y documentado.
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    try:
+        from cancellation import mark_cancelled, list_cancelled
+
+        added = mark_cancelled(job_id)
+        if added:
+            log_info(f"[cancel] Job {job_id} marcado para abortar (pendientes={len(list_cancelled())})")
+            return success_response(
+                data={"job_id": job_id, "already_marked": False},
+                message="Job marcado para cancelacion",
+            )
+        log_info(f"[cancel] Job {job_id} ya estaba marcado")
+        return success_response(
+            data={"job_id": job_id, "already_marked": True},
+            message="Job ya estaba marcado previamente",
+        )
+    except Exception as e:
+        log_warn(f"[cancel] Error marcando job {job_id}: {e}")
+        return error_response(str(e), 500)
+
 @app.get("/profiles/search/{name}")
 def search_profile(name: str):
     try:
@@ -538,8 +569,22 @@ def inject_hook():
 def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
     """Estabiliza ChatGPT: cierra tabs duplicadas, deja 1 sola lista para generar."""
     try:
+        # Auto-detectar puerto activo si el recibido murió
+        port = req.port
+        if not _test_cdp_port(port):
+            log_warn(f"[stabilize] Puerto CDP {port} no responde — buscando activo...")
+            running = service.get_running_profiles()
+            for p in running:
+                rp = p.get("debug_port", 0)
+                if rp and p.get("cdp_active"):
+                    port = rp
+                    log_ok(f"[stabilize] Puerto CDP actualizado: {port}")
+                    break
+            else:
+                return error_response(f"Puerto CDP {req.port} muerto y no se encontro reemplazo", 503)
+
         from chat_gpt_consulta.stabilize import stabilize_chatgpt
-        result = stabilize_chatgpt(port=req.port, timeout=req.timeout)
+        result = stabilize_chatgpt(port=port, timeout=req.timeout)
         if result.get("success"):
             return success_response(data=result, message=result.get("message", "ChatGPT estabilizado"))
         return error_response(result.get("error", "Error estabilizando"), 500, details=result)
@@ -550,9 +595,23 @@ def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
 @app.post("/chatgpt/prompt")
 def chatgpt_prompt(req: PromptRequest):
     try:
+        # Verificar que el puerto CDP sigue vivo — si murió, buscar el actual
+        port = req.port
+        if not _test_cdp_port(port):
+            log_warn(f"Puerto CDP {port} no responde — buscando puerto activo...")
+            running = service.get_running_profiles()
+            for p in running:
+                rp = p.get("debug_port", 0)
+                if rp and p.get("cdp_active"):
+                    port = rp
+                    log_ok(f"Puerto CDP actualizado: {port}")
+                    break
+            else:
+                return error_response(f"Puerto CDP {req.port} muerto y no se encontro reemplazo", 503)
+
         # Verificar proxy y crear tab sin proxy si es necesario
         from chat_gpt_consulta.proxy_bypass import ensure_chatgpt_reachable
-        port, tab_ws = ensure_chatgpt_reachable(req.port)
+        port, tab_ws = ensure_chatgpt_reachable(port)
         if not port:
             return error_response("Proxy muerto y no se pudo crear bypass", 503)
 
@@ -716,6 +775,11 @@ def veo3_download_video(req: Veo3DownloadVideoRequest):
 
 @app.post("/chatgpt/download-image")
 def chatgpt_download_image(req: ImageDownloadRequest):
+    # Se propaga req.job_id al flujo para que los loops internos puedan
+    # consultar el registry de cancelacion y abortar cooperativamente.
+    # Al terminar (en cualquier branch), limpiamos la bandera del registry
+    # para que el set no crezca indefinidamente entre ejecuciones.
+    from cancellation import clear as clear_cancel_flag, JobCancelled
     try:
         from chat_gpt_consulta.image_download import wait_and_download_image
         # Siempre guardar en el directorio propio del servidor
@@ -724,6 +788,7 @@ def chatgpt_download_image(req: ImageDownloadRequest):
             output_dir=str(IMAGES_DIR),
             timeout=req.timeout,
             target_ws=req.target_ws,
+            job_id=req.job_id,
         )
         if result.get("success"):
             # Agregar URL HTTP servible por este servidor
@@ -732,10 +797,25 @@ def chatgpt_download_image(req: ImageDownloadRequest):
                 result["image_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/images/{file_name}"
             _notify_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Imagen descargada")
+        # Si el flujo detecto cancelacion, lo reflejamos con status 499
+        # (codigo "client closed request") para que Publicidad lo distinga
+        # de un error real. El webhook NO se dispara para cancelados.
+        if result.get("error") == "cancelled":
+            log_info(f"[cancel] download-image cancelado limpiamente (job={req.job_id})")
+            return error_response("cancelled", 499, details=result)
         status_code = 429 if result.get("error") == "rate_limited" else 500
         return error_response(result.get("error", "Error desconocido"), status_code, details=result)
+    except JobCancelled as e:
+        # Propagada desde los loops internos via check_and_raise().
+        log_info(f"[cancel] JobCancelled propagada (job={req.job_id}): {e}")
+        return error_response("cancelled", 499, details={"job_id": req.job_id, "cancelled": True})
     except Exception as e:
         return error_response(str(e), 500)
+    finally:
+        # Limpiar la bandera siempre (exito, error, cancel) para que el
+        # set del registry no crezca indefinidamente.
+        if req.job_id:
+            clear_cancel_flag(req.job_id)
 
 @app.post("/veo3/extend-video")
 def veo3_extend_video(req: Veo3ExtendVideoRequest):

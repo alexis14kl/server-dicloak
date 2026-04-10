@@ -280,7 +280,8 @@ def _wait_for_generation_end(session: ChatGPTSession, timeout_sec: int) -> str:
     return status.lower() if status in ("DONE", "RATE_LIMITED", "NO_TOKENS", "TIMEOUT") else "done"
 
 
-def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300, anchor: dict | None = None) -> str:
+def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300,
+                   anchor: dict | None = None, job_id: str = "") -> str:
     """Espera que ChatGPT genere la imagen y retorna la URL final estable.
 
     Fase 1 — MutationObserver (cero polls): espera sin polling a que ChatGPT
@@ -288,13 +289,32 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300, anchor: dict
     Fase 2 — Polling mínimo: solo para verificar que la URL de imagen es estable
               (DALL-E sirve la misma URL de forma progresiva: primero preview,
               luego versión final). Máximo _STABLE_CHECKS_REQUIRED polls.
+
+    Cancelacion cooperativa:
+        Si se pasa job_id, al inicio del loop de fase 2 se consulta el
+        registry de cancelacion. Si el flag esta seteado, la funcion
+        levanta cancellation.JobCancelled para que el endpoint padre
+        centralice el manejo en su try/except. Latencia maxima entre
+        pausa y abort efectivo: ~8s (tiempo maximo del sleep mas largo).
     """
+    # Import local para no forzar dependencia si se usa wait_for_image
+    # desde un contexto de test sin el modulo de cancelacion.
+    from cancellation import check_and_raise
+
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
+
+    # Checkpoint pre-generacion — si el user cancelo antes de empezar.
+    if job_id:
+        check_and_raise(job_id)
 
     # ── Fase 1: MutationObserver — espera sin polling ────────────────────────
     remaining = max(20, int(deadline - time.time()))
     gen_status = _wait_for_generation_end(session, timeout_sec=remaining)
+
+    # Checkpoint post-generacion — el observer pudo durar varios segundos.
+    if job_id:
+        check_and_raise(job_id)
 
     if gen_status == "rate_limited":
         session.last_error = "rate_limited"
@@ -317,6 +337,12 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300, anchor: dict
     stable_count = 0
 
     while time.time() < deadline:
+        # Checkpoint de cancelacion en cada iteracion del polling.
+        # Con los sleeps de 3-8s, esto garantiza abort en <=8s desde
+        # que el usuario clickea "pausa".
+        if job_id:
+            check_and_raise(job_id)
+
         info = _check_image_state(session, anchor=anchor)
         status = info.get("status", "")
 
@@ -534,7 +560,7 @@ def download_image(session: ChatGPTSession, image_url: str, output_dir: str = ""
 
 
 def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
-                            target_ws: str = "") -> dict:
+                            target_ws: str = "", job_id: str = "") -> dict:
     """Espera la imagen generada y la descarga.
 
     Args:
@@ -543,10 +569,16 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
         timeout: Timeout en segundos para esperar la imagen
         target_ws: WebSocket URL exacta de la tab donde se envio el prompt.
                    Si se pasa, se conecta directo a esa tab sin buscar.
+        job_id: Identificador del job de Publicidad. Si se pasa, los loops
+                internos consultan el registry de cancelacion y abortan
+                cooperativamente si el flag esta seteado.
 
     Returns:
         dict con status, file_path, file_size, image_url
+        o {"success": False, "error": "cancelled"} si fue abortado.
     """
+    # Import local — ver nota en wait_for_image.
+    from cancellation import JobCancelled
     session = ChatGPTSession(port=port)
 
     if target_ws:
@@ -564,7 +596,8 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
         return {"success": False, "error": f"No se pudo conectar a ChatGPT en puerto {port}"}
 
     try:
-        # Esperar imagen
+        # Esperar imagen — propagamos job_id para habilitar cancelacion
+        # cooperativa en las fases de espera y polling.
         anchor = get_image_generation_anchor(target_ws) if target_ws else {}
         if anchor:
             log_info(
@@ -573,7 +606,7 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
                 f"{len(anchor.get('known_image_urls', []))} URLs previas"
             )
 
-        image_url = wait_for_image(session, timeout_sec=timeout, anchor=anchor)
+        image_url = wait_for_image(session, timeout_sec=timeout, anchor=anchor, job_id=job_id)
         if not image_url:
             # Determinar si fue por tokens agotados o timeout genérico
             if session.last_error == "rate_limited" or session._check_rate_limited():
@@ -603,6 +636,18 @@ def wait_and_download_image(port: int, output_dir: str = "", timeout: int = 300,
             "file_name": Path(file_path).name,
             "file_size": file_size,
             "image_url": image_url,
+        }
+
+    except JobCancelled as e:
+        # Cancelacion cooperativa detectada en un loop interno.
+        # Devolvemos un dict claro — el endpoint FastAPI lo traduce
+        # a HTTP 499 ("client closed request") en server.py.
+        log_warn(f"[cancel] wait_and_download_image cancelado: {e}")
+        return {
+            "success": False,
+            "error": "cancelled",
+            "cancelled": True,
+            "message": "Operacion cancelada por el usuario",
         }
 
     finally:
