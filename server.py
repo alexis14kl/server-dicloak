@@ -80,6 +80,7 @@ from logger import log_info, log_ok, log_warn
 
 SERVER_PORT = int(os.environ.get("DICLOAK_API_PORT", "0") or "0") or 8585
 DICLOAK_PORT = int(os.environ.get("CDP_DICLOAK_PORT", "0") or "0") or DEFAULT_DICLOAK_PORT
+PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL", "") or f"http://127.0.0.1:{SERVER_PORT}").rstrip("/")
 IMAGES_DIR = PROJECT_ROOT / "output" / "images"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +106,10 @@ def error_response(message: str, status_code: int = 500, details: Any = None) ->
         status_code=status_code,
         media_type="application/json",
     )
+
+
+def public_url(path: str) -> str:
+    return f"{PUBLIC_BASE_URL}/{path.lstrip('/')}"
 
 
 # ── Service layer ─────────────────────────────────────────────────────────────
@@ -766,7 +771,7 @@ def veo3_download_video(req: Veo3DownloadVideoRequest):
             # Construir video_url HTTP servible (mismo patron que imagen)
             file_name = result.get("file_name", "")
             if file_name:
-                result["video_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/output/videos/{file_name}"
+                result["video_url"] = public_url(f"/files/output/videos/{file_name}")
             _notify_video_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Video descargado")
         return error_response(result.get("error", "Error desconocido"), 500, details=result)
@@ -794,7 +799,7 @@ def chatgpt_download_image(req: ImageDownloadRequest):
             # Agregar URL HTTP servible por este servidor
             file_name = result.get("file_name", "")
             if file_name:
-                result["image_url"] = f"http://127.0.0.1:{SERVER_PORT}/files/images/{file_name}"
+                result["image_url"] = public_url(f"/files/images/{file_name}")
             _notify_webhook(req.webhook_url, req.job_id, result)
             return success_response(data=result, message="Imagen descargada")
         # Si el flujo detecto cancelacion, lo reflejamos con status 499
