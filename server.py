@@ -117,9 +117,15 @@ def public_url(path: str) -> str:
 # ── Service layer ─────────────────────────────────────────────────────────────
 
 class DICloakService:
+    # Serializa llamadas concurrentes a open_profile: la UI de DICloak es una
+    # sola ventana y _wait_for_cdp_port no distingue a qué perfil pertenece el
+    # puerto encontrado. Sin este lock dos aperturas simultáneas podrían
+    # retornar el mismo puerto o interferir en los clicks del DOM.
+    _open_lock: threading.Lock = threading.Lock()
 
     def __init__(self, dicloak_port: int = DEFAULT_DICLOAK_PORT):
         self.port = dicloak_port
+        self._openapi_available: bool | None = None  # instancia, no clase
 
     def check_health(self) -> dict:
         ready = is_dicloak_ready(self.port)
@@ -129,8 +135,6 @@ class DICloakService:
             "dicloak_ready": ready,
             "targets_count": len(targets),
         }
-
-    _openapi_available: bool | None = None  # cache: None=no probado, True/False=resultado
 
     def get_profiles(self) -> list[dict]:
         # Intentar REST API solo si no ha fallado antes (evita ~10s de timeouts)
@@ -177,6 +181,13 @@ class DICloakService:
         return running
 
     def open_profile(self, name: str, timeout: int = 60) -> dict:
+        # Serializar aperturas: DICloak tiene una sola UI y _wait_for_cdp_port
+        # retorna el primer puerto activo encontrado sin diferenciar perfiles.
+        # Dos llamadas simultáneas interferirían en clicks y en la espera del puerto.
+        with self._open_lock:
+            return self._open_profile_locked(name, timeout)
+
+    def _open_profile_locked(self, name: str, timeout: int) -> dict:
         if not name:
             raise ValueError("El nombre del perfil es requerido.")
         if not is_dicloak_ready(self.port):
