@@ -112,3 +112,40 @@ def list_cancelled() -> list[str]:
     """Lista los jobs marcados (debug / introspection)."""
     with _lock:
         return sorted(_cancelled)
+
+
+# ─── Shutdown cooperativo del server ─────────────────────────────────────
+# Cuando uvicorn recibe Ctrl+C dispara el lifespan shutdown, que llama a
+# request_shutdown(). Los loops largos (image_download fase 2, etc.) usan
+# interruptible_sleep() en lugar de time.sleep() para reaccionar en cuanto
+# el flag se activa, en vez de quedar bloqueados hasta que uvicorn los mata
+# por timeout_graceful_shutdown.
+_shutdown_event = threading.Event()
+
+
+def request_shutdown() -> None:
+    """Marca el server como apagandose. Despierta cualquier interruptible_sleep."""
+    _shutdown_event.set()
+
+
+def is_shutting_down() -> bool:
+    return _shutdown_event.is_set()
+
+
+def interruptible_sleep(seconds: float, job_id: str = "") -> None:
+    """Sleep cooperativo: respeta shutdown del server y cancelacion del job.
+
+    Reemplaza directamente a `time.sleep(seconds)` en los loops de polling.
+    Si durante el sleep:
+      - se activa el shutdown del server, levanta JobCancelled("shutdown")
+      - el job esta marcado para cancelar, levanta JobCancelled(...)
+    Si no, retorna normalmente al cumplirse el tiempo.
+    """
+    if seconds <= 0:
+        if job_id:
+            check_and_raise(job_id)
+        return
+    if _shutdown_event.wait(timeout=seconds):
+        raise JobCancelled("server shutting down")
+    if job_id:
+        check_and_raise(job_id)

@@ -41,6 +41,8 @@ if env_path.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -412,7 +414,29 @@ def ensure_dicloak_running(port: int = DEFAULT_DICLOAK_PORT, timeout: int = 20) 
 
 from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="DICloak Control API", version="1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Hook de ciclo de vida. En shutdown notifica a los loops cooperativos
+    para que aborten sin esperar al timeout de uvicorn."""
+    yield
+    # Uvicorn ya recibio Ctrl+C y esta cerrando — marcar el shutdown event
+    # para que los loops largos (image_download fase 2, polling de veo3, etc.)
+    # rompan en el siguiente checkpoint en vez de quedar bloqueados.
+    try:
+        from cancellation import request_shutdown
+        request_shutdown()
+        log_warn("[shutdown] shutdown event marcado — loops cooperativos abortando")
+    except Exception:
+        pass
+    try:
+        from cdp_bridge import close_cdp
+        close_cdp()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="DICloak Control API", version="1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Servir archivos descargados (imagenes y videos)
@@ -423,6 +447,54 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/files/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 
 service = DICloakService(DICLOAK_PORT)
+
+
+# ── Pool routing helper ──────────────────────────────────────────────────────
+# Resuelve el puerto CDP correcto segun el pool del endpoint (image / video).
+#
+# El orchestrator (Publicidad/Django) mantiene el flujo actual:
+#   1. POST /profiles/open {"name": "..."}     → DICloak abre el perfil y devuelve port
+#   2. POST /chatgpt/stabilize  {"port": ...}  → estabiliza la sesion ChatGPT
+#   3. POST /chatgpt/prompt     {"port": ...}  → pega prompt
+#   4. POST /chatgpt/download-image            → espera y descarga imagen
+#   (con rotacion de cuentas dentro del mismo perfil cuando hay rate limit)
+#
+# Reglas de resolucion:
+#   1. Puerto del cliente vivo + clasificado al pool correcto → usar tal cual.
+#   2. Puerto vivo pero SIN clasificar (perfil recien abierto, homepage aun cargando,
+#      o redirigiendo entre paginas de auth) → CONFIAR en el cliente, no romper
+#      el flujo. El lock del pool sigue protegiendo concurrencia.
+#   3. Puerto vivo pero del pool EQUIVOCADO → redirigir al pool correcto via
+#      descubrimiento dinamico (proteccion contra cross-talk).
+#   4. Puerto muerto/vacio → resolver dinamicamente desde los perfiles corriendo.
+#   5. Sin candidatos → 503 con mensaje claro.
+def resolve_pool_port(client_port: int, pool: str) -> tuple[int, str]:
+    """Devuelve (puerto, error). Si error != "", el endpoint debe abortar."""
+    from profile_pool import classify_port, resolve_port
+
+    if client_port and _test_cdp_port(client_port):
+        actual = classify_port(client_port)
+        if actual == pool:
+            return client_port, ""
+        if actual is None:
+            # Perfil recien abierto via /profiles/open: el navegador aun esta
+            # cargando la homepage del perfil (chatgpt.com o labs.google). En
+            # este momento /json todavia no tiene una URL reconocible. NO
+            # romper el flujo — el orchestrator sabe que perfil abrio y para
+            # que. El lock del pool sigue serializando correctamente.
+            log_info(f"[pool/{pool}] puerto {client_port} sin pestaña reconocible aun — confiando en el cliente")
+            return client_port, ""
+        # Pool equivocado: el orchestrator mando un puerto que clasifica a
+        # otro pool. Redirigir dinamicamente para evitar cross-talk.
+        log_warn(f"[pool/{pool}] puerto {client_port} pertenece al pool '{actual}' — redirigiendo")
+
+    running = service.get_running_profiles()
+    resolved = resolve_port(pool, running)
+    if resolved:
+        if resolved != client_port:
+            log_ok(f"[pool/{pool}] puerto resuelto dinamicamente: {resolved}")
+        return resolved, ""
+    return 0, f"No hay perfil activo para el pool '{pool}' (orchestrator debe llamar /profiles/open primero)"
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -530,6 +602,62 @@ def running_profiles():
     except Exception as e:
         return error_response(str(e), 500)
 
+
+@app.get("/pools")
+def pools_status():
+    """Estado del routing por pool (debug). Muestra que perfiles activos
+    estan en cada pool y que locks estan ocupados ahora mismo.
+
+    Util para verificar que el orchestrator abrio los perfiles correctos
+    (uno con chatgpt.com, otro con labs.google) y que las peticiones
+    concurrentes estan tomando los locks que esperabamos.
+    """
+    try:
+        from profile_pool import (
+            discover_pools, classify_port, _pool_locks, known_pools,
+            POOL_URL_PATTERNS,
+        )
+        running = service.get_running_profiles()
+        mapping = discover_pools(running, force=True)
+
+        # Detalle por puerto: incluir si el lock del pool esta tomado.
+        # acquire(blocking=False) es no destructivo: si el lock esta libre lo
+        # toma momentaneamente y lo suelta inmediatamente; si esta tomado
+        # devuelve False sin bloquear.
+        pools_info = {}
+        for pool_name in known_pools():
+            lock = _pool_locks[pool_name]
+            acquired = lock.acquire(blocking=False)
+            if acquired:
+                lock.release()
+                lock_busy = False
+            else:
+                lock_busy = True
+            pools_info[pool_name] = {
+                "ports": mapping.get(pool_name, []),
+                "lock_busy": lock_busy,
+                "url_patterns": list(POOL_URL_PATTERNS[pool_name]),
+            }
+
+        # Detalle por puerto running: que pool quedo asignado (o None)
+        running_detail = []
+        for prof in running:
+            port = prof.get("debug_port", 0)
+            running_detail.append({
+                "pid": prof.get("pid", 0),
+                "debug_port": port,
+                "cdp_active": prof.get("cdp_active", False),
+                "classified_pool": classify_port(port) if prof.get("cdp_active") else None,
+            })
+
+        return success_response(data={
+            "pools": pools_info,
+            "running_profiles": running_detail,
+            "total_running": len(running),
+        }, message="Estado de pools")
+    except Exception as e:
+        return error_response(str(e), 500)
+
 @app.post("/profiles/open")
 def open_profile(req: OpenProfileRequest):
     try:
@@ -573,23 +701,15 @@ def inject_hook():
 @app.post("/chatgpt/stabilize")
 def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
     """Estabiliza ChatGPT: cierra tabs duplicadas, deja 1 sola lista para generar."""
+    from profile_pool import acquire_pool_lock
     try:
-        # Auto-detectar puerto activo si el recibido murió
-        port = req.port
-        if not _test_cdp_port(port):
-            log_warn(f"[stabilize] Puerto CDP {port} no responde — buscando activo...")
-            running = service.get_running_profiles()
-            for p in running:
-                rp = p.get("debug_port", 0)
-                if rp and p.get("cdp_active"):
-                    port = rp
-                    log_ok(f"[stabilize] Puerto CDP actualizado: {port}")
-                    break
-            else:
-                return error_response(f"Puerto CDP {req.port} muerto y no se encontro reemplazo", 503)
+        port, err = resolve_pool_port(req.port, "image")
+        if err:
+            return error_response(err, 503)
 
-        from chat_gpt_consulta.stabilize import stabilize_chatgpt
-        result = stabilize_chatgpt(port=port, timeout=req.timeout)
+        with acquire_pool_lock("image"):
+            from chat_gpt_consulta.stabilize import stabilize_chatgpt
+            result = stabilize_chatgpt(port=port, timeout=req.timeout)
         if result.get("success"):
             return success_response(data=result, message=result.get("message", "ChatGPT estabilizado"))
         return error_response(result.get("error", "Error estabilizando"), 500, details=result)
@@ -599,21 +719,22 @@ def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
 
 @app.post("/chatgpt/prompt")
 def chatgpt_prompt(req: PromptRequest):
+    from profile_pool import acquire_pool_lock
     try:
-        # Verificar que el puerto CDP sigue vivo — si murió, buscar el actual
-        port = req.port
-        if not _test_cdp_port(port):
-            log_warn(f"Puerto CDP {port} no responde — buscando puerto activo...")
-            running = service.get_running_profiles()
-            for p in running:
-                rp = p.get("debug_port", 0)
-                if rp and p.get("cdp_active"):
-                    port = rp
-                    log_ok(f"Puerto CDP actualizado: {port}")
-                    break
-            else:
-                return error_response(f"Puerto CDP {req.port} muerto y no se encontro reemplazo", 503)
+        port, err = resolve_pool_port(req.port, "image")
+        if err:
+            return error_response(err, 503)
 
+        # Lock del pool image — serializa peticiones del flujo de imagenes,
+        # pero no bloquea peticiones del pool video (que corren en paralelo).
+        with acquire_pool_lock("image"):
+            return _chatgpt_prompt_locked(req, port)
+    except Exception as e:
+        return error_response(str(e), 500)
+
+
+def _chatgpt_prompt_locked(req: PromptRequest, port: int):
+    try:
         # Verificar proxy y crear tab sin proxy si es necesario
         from chat_gpt_consulta.proxy_bypass import ensure_chatgpt_reachable
         port, tab_ws = ensure_chatgpt_reachable(port)
@@ -708,14 +829,19 @@ def chatgpt_prompt(req: PromptRequest):
 
 @app.post("/chatgpt/send-pasted")
 def chatgpt_send_pasted(req: SendPastedPromptRequest):
+    from profile_pool import acquire_pool_lock
     try:
-        from chat_gpt_consulta.prompt_paste import send_pasted_prompt
-        result = send_pasted_prompt(
-            port=req.port,
-            wait_response=req.wait_response,
-            timeout=req.timeout,
-            target_ws=req.target_ws,
-        )
+        port, err = resolve_pool_port(req.port, "image")
+        if err:
+            return error_response(err, 503)
+        with acquire_pool_lock("image"):
+            from chat_gpt_consulta.prompt_paste import send_pasted_prompt
+            result = send_pasted_prompt(
+                port=port,
+                wait_response=req.wait_response,
+                timeout=req.timeout,
+                target_ws=req.target_ws,
+            )
         if result.get("success"):
             return success_response(data=result, message="Prompt pegado enviado a ChatGPT")
         status_code = 429 if result.get("error") == "rate_limited" else 500
@@ -726,9 +852,14 @@ def chatgpt_send_pasted(req: SendPastedPromptRequest):
 
 @app.post("/veo3/stabilize")
 def veo3_stabilize(req: Veo3StabilizeRequest):
+    from profile_pool import acquire_pool_lock
     try:
-        from chat_veo3_videos.veo3_session import navigate_and_stabilize
-        result = navigate_and_stabilize(port=req.port, timeout=req.timeout)
+        port, err = resolve_pool_port(req.port, "video")
+        if err:
+            return error_response(err, 503)
+        with acquire_pool_lock("video"):
+            from chat_veo3_videos.veo3_session import navigate_and_stabilize
+            result = navigate_and_stabilize(port=port, timeout=req.timeout)
         if result.get("success"):
             return success_response(data=result, message="Veo 3 estable y listo")
         return error_response(result.get("error", "Error desconocido"), 500, details=result.get("details"))
@@ -741,9 +872,14 @@ class Veo3NewProjectRequest(BaseModel):
 
 @app.post("/veo3/new-project")
 def veo3_new_project(req: Veo3NewProjectRequest):
+    from profile_pool import acquire_pool_lock
     try:
-        from chat_veo3_videos.veo3_session import open_new_project
-        result = open_new_project(port=req.port, prompt=req.prompt)
+        port, err = resolve_pool_port(req.port, "video")
+        if err:
+            return error_response(err, 503)
+        with acquire_pool_lock("video"):
+            from chat_veo3_videos.veo3_session import open_new_project
+            result = open_new_project(port=port, prompt=req.prompt)
         if result.get("success"):
             return success_response(data=result, message="Nuevo proyecto abierto en Flow")
         # Propagar error clasificado en 'details' para que el cliente Python
@@ -760,13 +896,18 @@ def veo3_new_project(req: Veo3NewProjectRequest):
 
 @app.post("/veo3/download-video")
 def veo3_download_video(req: Veo3DownloadVideoRequest):
+    from profile_pool import acquire_pool_lock
     try:
-        from chat_veo3_videos.exten_video import download_extended_video
-        result = download_extended_video(
-            port=req.port,
-            timeout=req.timeout,
-            output_dir=req.output_dir,
-        )
+        port, err = resolve_pool_port(req.port, "video")
+        if err:
+            return error_response(err, 503)
+        with acquire_pool_lock("video"):
+            from chat_veo3_videos.exten_video import download_extended_video
+            result = download_extended_video(
+                port=port,
+                timeout=req.timeout,
+                output_dir=req.output_dir,
+            )
         if result.get("success"):
             # Construir video_url HTTP servible (mismo patron que imagen)
             file_name = result.get("file_name", "")
@@ -785,16 +926,22 @@ def chatgpt_download_image(req: ImageDownloadRequest):
     # Al terminar (en cualquier branch), limpiamos la bandera del registry
     # para que el set no crezca indefinidamente entre ejecuciones.
     from cancellation import clear as clear_cancel_flag, JobCancelled
+    from profile_pool import acquire_pool_lock
     try:
-        from chat_gpt_consulta.image_download import wait_and_download_image
-        # Siempre guardar en el directorio propio del servidor
-        result = wait_and_download_image(
-            port=req.port,
-            output_dir=str(IMAGES_DIR),
-            timeout=req.timeout,
-            target_ws=req.target_ws,
-            job_id=req.job_id,
-        )
+        port, err = resolve_pool_port(req.port, "image")
+        if err:
+            return error_response(err, 503)
+
+        with acquire_pool_lock("image"):
+            from chat_gpt_consulta.image_download import wait_and_download_image
+            # Siempre guardar en el directorio propio del servidor
+            result = wait_and_download_image(
+                port=port,
+                output_dir=str(IMAGES_DIR),
+                timeout=req.timeout,
+                target_ws=req.target_ws,
+                job_id=req.job_id,
+            )
         if result.get("success"):
             # Agregar URL HTTP servible por este servidor
             file_name = result.get("file_name", "")
@@ -824,9 +971,14 @@ def chatgpt_download_image(req: ImageDownloadRequest):
 
 @app.post("/veo3/extend-video")
 def veo3_extend_video(req: Veo3ExtendVideoRequest):
+    from profile_pool import acquire_pool_lock
     try:
-        from chat_veo3_videos.exten_video import extend_video
-        result = extend_video(port=req.port, prompt=req.prompt)
+        port, err = resolve_pool_port(req.port, "video")
+        if err:
+            return error_response(err, 503)
+        with acquire_pool_lock("video"):
+            from chat_veo3_videos.exten_video import extend_video
+            result = extend_video(port=port, prompt=req.prompt)
         if result.get("success"):
             return success_response(data=result, message="Prompt de extension enviado")
         return error_response(result.get("error", "Error desconocido"), 500, details=result)
@@ -942,6 +1094,10 @@ def main():
                 print(f"[OK] Navegador activo — CDP puerto {port} | http://127.0.0.1:{port}/json/version")
 
     dev_mode = os.environ.get("DEV_RELOAD", "0") == "1"
+    # timeout_graceful_shutdown=8: si tras 8s los threads no terminaron
+    # (porque estan en CDP/_ws.recv bloqueante), uvicorn fuerza el exit.
+    # Combinado con request_shutdown() en el lifespan + interruptible_sleep
+    # en los loops, el caso normal cierra en <1s y el peor en ~8s.
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
@@ -949,6 +1105,7 @@ def main():
         log_level="info",
         reload=dev_mode,
         reload_dirs=[str(PROJECT_ROOT)] if dev_mode else [],
+        timeout_graceful_shutdown=8,
     )
 
 

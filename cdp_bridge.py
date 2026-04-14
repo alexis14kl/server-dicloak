@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -140,15 +141,39 @@ class CDPConnection:
             self._ws = None
 
 
-# Conexión global
-_cdp: CDPConnection | None = None
+# Pool de conexiones CDP — una por puerto. Antes era un singleton global
+# que se reemplazaba si el puerto cambiaba; con concurrencia entre pools
+# (image vs video) eso causaba race conditions y leaks de WebSocket. Ahora
+# se mantiene una conexion persistente por cada puerto, protegida por lock.
+_cdp_pool: dict[int, CDPConnection] = {}
+_cdp_pool_lock = threading.Lock()
 
 
 def get_cdp(port: int = DEFAULT_DICLOAK_PORT) -> CDPConnection:
-    global _cdp
-    if _cdp is None or _cdp.port != port:
-        _cdp = CDPConnection(port)
-    return _cdp
+    with _cdp_pool_lock:
+        cdp = _cdp_pool.get(port)
+        if cdp is None:
+            cdp = CDPConnection(port)
+            _cdp_pool[port] = cdp
+        return cdp
+
+
+def close_cdp(port: int | None = None) -> None:
+    """Cierra conexiones CDP del pool. Sin argumento cierra todas."""
+    with _cdp_pool_lock:
+        if port is None:
+            for cdp in _cdp_pool.values():
+                try:
+                    cdp.close()
+                except Exception:
+                    pass
+            _cdp_pool.clear()
+        elif port in _cdp_pool:
+            try:
+                _cdp_pool[port].close()
+            except Exception:
+                pass
+            del _cdp_pool[port]
 
 
 def init_cdp(port: int = DEFAULT_DICLOAK_PORT) -> bool:

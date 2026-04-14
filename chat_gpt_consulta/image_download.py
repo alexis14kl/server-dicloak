@@ -299,7 +299,14 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300,
     """
     # Import local para no forzar dependencia si se usa wait_for_image
     # desde un contexto de test sin el modulo de cancelacion.
-    from cancellation import check_and_raise
+    from cancellation import check_and_raise, interruptible_sleep
+
+    # Helper local: sleep que respeta job cancel + server shutdown.
+    # Reemplaza time.sleep() en el polling para no quedar dormido cuando
+    # uvicorn esta cerrando (Ctrl+C). Si se dispara el shutdown, levanta
+    # JobCancelled y el endpoint la captura como cancelacion.
+    def _sleep(seconds):
+        interruptible_sleep(seconds, job_id or "")
 
     deadline = time.time() + timeout_sec
     log_info("Esperando imagen generada por ChatGPT...")
@@ -349,14 +356,14 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300,
         if status == "COMPARISON_RESOLVED":
             log_info("Comparación de imágenes resuelta, esperando URL...")
             stable_url, stable_count = "", 0
-            time.sleep(4)
+            _sleep(4)
             continue
 
         if status == "LOADING":
             w = info.get("width", 0)
             log_info(f"Imagen cargando (width={w}). Esperando...")
             stable_url, stable_count = "", 0
-            time.sleep(8)
+            _sleep(8)
             continue
 
         if status == "READY":
@@ -374,13 +381,13 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300,
                 return url
 
             log_info(f"Check de estabilidad {stable_count}/{_STABLE_CHECKS_REQUIRED}...")
-            time.sleep(_STABLE_CHECK_INTERVAL)
+            _sleep(_STABLE_CHECK_INTERVAL)
             continue
 
         if status == "GENERATING":
             # Aún generando después del MutationObserver — esperar más
             log_info("Aún generando, esperando...")
-            time.sleep(3)
+            _sleep(3)
             continue
 
         # WAITING — imagen aún no apareció tras terminar la generación
@@ -392,7 +399,7 @@ def wait_for_image(session: ChatGPTSession, timeout_sec: int = 300,
         if session._check_no_tokens():
             log_warn("Tokens agotados detectados tras generación")
             return ""
-        time.sleep(5)
+        _sleep(5)
 
     log_warn("Timeout esperando imagen")
     return ""
