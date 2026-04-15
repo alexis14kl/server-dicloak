@@ -607,30 +607,27 @@ service = DICloakService(DICLOAK_PORT)
 #   4. Puerto muerto/vacio → resolver dinamicamente desde los perfiles corriendo.
 #   5. Sin candidatos → 503 con mensaje claro.
 def resolve_pool_port(client_port: int, pool: str) -> tuple[int, str]:
-    """Devuelve (puerto, error). Si error != "", el endpoint debe abortar."""
-    from profile_pool import classify_port, resolve_port
+    """Devuelve (puerto, error). Si error != "", el endpoint debe abortar.
 
+    IMPORTANTE: Django reserva perfiles atomicamente upfront (ResourceLock
+    por 'profile:<nombre>') y luego abre cada perfil obteniendo su propio
+    puerto. Cuando llama a /chatgpt/prompt con ese puerto, sabemos que es
+    el correcto — NO re-clasificar ni redirigir. Hacerlo rompia el
+    paralelismo porque N requests paralelos convergian al mismo "primer
+    puerto del pool" cuando classify_port fallaba (tab aun cargando,
+    redirigiendo, o clasificando en otro pool temporalmente).
+    """
+    from profile_pool import resolve_port
+
+    # Confiar en el puerto del cliente si esta vivo. Punto.
     if client_port and _test_cdp_port(client_port):
-        actual = classify_port(client_port)
-        if actual == pool:
-            return client_port, ""
-        if actual is None:
-            # Perfil recien abierto via /profiles/open: el navegador aun esta
-            # cargando la homepage del perfil (chatgpt.com o labs.google). En
-            # este momento /json todavia no tiene una URL reconocible. NO
-            # romper el flujo — el orchestrator sabe que perfil abrio y para
-            # que. El lock del pool sigue serializando correctamente.
-            log_info(f"[pool/{pool}] puerto {client_port} sin pestaña reconocible aun — confiando en el cliente")
-            return client_port, ""
-        # Pool equivocado: el orchestrator mando un puerto que clasifica a
-        # otro pool. Redirigir dinamicamente para evitar cross-talk.
-        log_warn(f"[pool/{pool}] puerto {client_port} pertenece al pool '{actual}' — redirigiendo")
+        return client_port, ""
 
+    # Fallback legacy: solo cuando el cliente no paso puerto o esta muerto.
     running = service.get_running_profiles()
     resolved = resolve_port(pool, running)
     if resolved:
-        if resolved != client_port:
-            log_ok(f"[pool/{pool}] puerto resuelto dinamicamente: {resolved}")
+        log_warn(f"[pool/{pool}] cliente sin puerto vivo — resuelto dinamicamente: {resolved}")
         return resolved, ""
     return 0, f"No hay perfil activo para el pool '{pool}' (orchestrator debe llamar /profiles/open primero)"
 
