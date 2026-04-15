@@ -227,6 +227,28 @@ class DICloakService:
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde. Verifica que este abierto.")
 
+        # Estrategia 0 (preferida): matcheo por serialNumber del DOM de DICloak.
+        # Lee el numero del perfil de la tabla (ej. "98") y busca ese mismo
+        # serialNumber en cdp_debug_info.json. Si hay un debugPort vivo para
+        # ese serial, lo reusamos SIN hacer click ni abrir nada.
+        # Esto evita cerrar y reabrir perfiles que ya estan trabajando.
+        try:
+            from inspector_inject import find_active_cdp_for_profile
+            existing_port = find_active_cdp_for_profile(name)
+            if existing_port:
+                log_ok(
+                    f"Perfil '{name}' ya tiene CDP activo en puerto {existing_port} — reusando"
+                )
+                return {
+                    "name": name,
+                    "debug_port": existing_port,
+                    "ws_url": "",
+                    "cdp_active": True,
+                    "reused": True,
+                }
+        except Exception as exc:
+            log_warn(f"Pre-check por serialNumber fallo: {exc}")
+
         # Estrategia 1: Si el perfil solicitado YA esta asociado a un puerto
         # vivo en cdp_debug_info.json, reutilizar directo. Sin lock.
         # NOTA: esto retorna el primer puerto encontrado en el archivo, lo
@@ -494,6 +516,17 @@ def ensure_dicloak_running(port: int = DEFAULT_DICLOAK_PORT, timeout: int = 20) 
     if is_dicloak_ready(port):
         print(f"[OK] DICloak ya responde en puerto {port}")
         return True
+
+    # NUEVO: si DICloak esta corriendo manualmente sin debug, intentar
+    # attach via inspector V8 (sin matar ni reiniciar). Si el attach tiene
+    # exito, monkey-patchea cdp_bridge y el resto del flujo continua igual.
+    try:
+        from inspector_inject import try_attach_existing_dicloak
+        if try_attach_existing_dicloak():
+            print("[OK] DICloak attached via inspector V8 (sin reiniciar)")
+            return True
+    except Exception as exc:
+        print(f"[WARN] Attach via inspector fallo: {exc}")
 
     dicloak_exe = find_dicloak_exe()
     if not dicloak_exe:
@@ -1162,9 +1195,29 @@ def main():
 
     ensure_dicloak_running(dicloak_port)
 
-    # Limpiar estado de sesiones anteriores
-    write_cdp_debug_info({})
-    print("[OK] cdp_debug_info limpiado")
+    # Filtrar cdp_debug_info: mantener solo entradas con debugPort vivo.
+    # Antes hacia write({}) wipe completo — eso borraba perfiles que ya
+    # estaban corriendo con CDP cuando DICloak fue abierto manualmente
+    # antes del server (modo attach), destruyendo su registro. Ahora
+    # solo limpiamos entradas stale.
+    existing_cdp_info = read_cdp_debug_info()
+    live_cdp_info = {}
+    for key, entry in existing_cdp_info.items():
+        if not isinstance(entry, dict):
+            continue
+        port = entry.get("debugPort", 0)
+        try:
+            port = int(port) if port else 0
+        except (TypeError, ValueError):
+            port = 0
+        if port and _test_cdp_port(port):
+            live_cdp_info[key] = entry
+    write_cdp_debug_info(live_cdp_info)
+    stale_removed = len(existing_cdp_info) - len(live_cdp_info)
+    if stale_removed > 0:
+        print(f"[OK] cdp_debug_info: {len(live_cdp_info)} perfiles vivos, {stale_removed} stale removidos")
+    else:
+        print(f"[OK] cdp_debug_info: {len(live_cdp_info)} perfiles vivos")
 
     # Esperar a que DiCloak cargue su página
     for _ in range(15):
