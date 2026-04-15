@@ -118,11 +118,16 @@ def public_url(path: str) -> str:
 
 class DICloakService:
     # Lock CORTO que solo protege el click en la UI de DICloak (una sola
-    # ventana, dos clicks simultaneos se pisarian). La espera por el nuevo
-    # puerto CDP corre FUERA del lock para permitir aperturas en paralelo:
-    # cada caller snapshotea los puertos activos antes de clickear y luego
-    # espera a que aparezca un puerto NUEVO (no presente en el snapshot).
+    # ventana, dos clicks simultaneos se pisarian). ~50-200ms.
     _click_lock: threading.Lock = threading.Lock()
+
+    # Set de puertos "en reclamacion" por aperturas concurrentes. Cada
+    # caller que detecta un puerto nuevo lo agrega atomicamente aqui, y
+    # los demas callers lo excluyen de su busqueda — asi dos aperturas
+    # paralelas no se roban el puerto mutuamente sin necesidad de
+    # sostener el _click_lock durante la espera larga del CDP.
+    _claim_lock: threading.Lock = threading.Lock()
+    _claimed_ports: set[int] = set()
 
     def __init__(self, dicloak_port: int = DEFAULT_DICLOAK_PORT):
         self.port = dicloak_port
@@ -187,6 +192,9 @@ class DICloakService:
         Se usa ANTES de clickear un nuevo perfil para poder luego
         diferenciar cual es el puerto nuevo que aparecio (el del perfil
         recien abierto), permitiendo aperturas en paralelo.
+
+        Ademas limpia _claimed_ports de puertos ya muertos (perfiles
+        cerrados) para evitar que el set crezca sin limite.
         """
         ports: set[int] = set()
         data = read_cdp_debug_info()
@@ -203,6 +211,14 @@ class DICloakService:
             rp = int(prof.get("debug_port", 0) or 0)
             if rp and prof.get("cdp_active"):
                 ports.add(rp)
+
+        # Limpieza: quitar de _claimed_ports los que ya no estan vivos.
+        with self._claim_lock:
+            dead = self._claimed_ports - ports
+            if dead:
+                self._claimed_ports -= dead
+                log_info(f"Claimed ports limpiados (perfiles cerrados): {sorted(dead)}")
+
         return ports
 
     def open_profile(self, name: str, timeout: int = 60) -> dict:
@@ -236,14 +252,15 @@ class DICloakService:
                     "cdp_active": True,
                 }
 
-        # Snapshot de puertos activos ANTES del click — para detectar el
-        # puerto nuevo despues del click (permite paralelismo).
+        # Snapshot de puertos activos ANTES de entrar al click lock.
+        # El lock solo protege el click (~50-200ms), la espera larga por
+        # el CDP ocurre fuera para no bloquear otras aperturas.
         known_ports = self._snapshot_active_ports()
-        log_info(f"Snapshot puertos activos antes de abrir '{name}': {sorted(known_ports)}")
+        # Excluir tambien puertos que otros threads ya reclamaron para si.
+        with self._claim_lock:
+            exclude_set = known_ports | set(self._claimed_ports)
+        log_info(f"Snapshot puertos antes de abrir '{name}': known={sorted(known_ports)} claimed={sorted(self._claimed_ports)}")
 
-        # Click en la UI de DiCloak — SERIALIZADO (ventana unica).
-        # El lock se libera apenas termina el click, la espera del puerto
-        # ocurre fuera para permitir aperturas concurrentes.
         with self._click_lock:
             status = open_profile_via_cdp(name, self.port)
 
@@ -253,11 +270,15 @@ class DICloakService:
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
+        # Espera fuera del lock. _wait_for_cdp_port reclamara atomicamente
+        # el primer puerto nuevo que encuentre (agregandolo a _claimed_ports)
+        # para que aperturas paralelas no lo tomen.
+        claimed_port = self._wait_and_claim_port(timeout, exclude_set)
+
         if status == "ALREADY_OPEN":
             log_info(f"Perfil '{name}' ya abierto — buscando CDP...")
-            port = self._wait_for_cdp_port(timeout, exclude=known_ports)
-            if port:
-                return {"name": name, "debug_port": port, "ws_url": "",
+            if claimed_port:
+                return {"name": name, "debug_port": claimed_port, "ws_url": "",
                         "cdp_active": True}
             log_warn("Perfil abierto sin CDP — reinyectando hook...")
             try:
@@ -265,20 +286,19 @@ class DICloakService:
                 time.sleep(3)
             except Exception:
                 pass
-            port = self._wait_for_cdp_port(min(timeout, 20), exclude=known_ports)
+            port = self._wait_and_claim_port(min(timeout, 20), exclude_set)
             if port:
                 return {"name": name, "debug_port": port, "ws_url": "",
                         "cdp_active": True}
             return {"name": name, "debug_port": 0, "ws_url": "",
                     "cdp_active": False, "clicked": False}
 
-        # CLICKED_OPEN — se hizo click, esperar un puerto NUEVO
-        port = self._wait_for_cdp_port(timeout, exclude=known_ports)
-        if port:
-            return {"name": name, "debug_port": port, "ws_url": "",
+        # CLICKED_OPEN — ya tenemos claimed_port
+        if claimed_port:
+            return {"name": name, "debug_port": claimed_port, "ws_url": "",
                     "cdp_active": True, "clicked": True}
 
-        # Sin CDP tras abrir: reintento con reinyeccion (serializado).
+        # Sin CDP tras abrir: reintento con reinyeccion.
         log_warn("CDP no disponible tras abrir — reinyectando hook y reabriendo...")
         try:
             inject_cdp_hook(self.port)
@@ -286,12 +306,13 @@ class DICloakService:
         except Exception:
             pass
 
-        # Re-snapshot por si algo cambio; luego reclick serializado.
         known_ports_2 = self._snapshot_active_ports()
+        with self._claim_lock:
+            exclude_set_2 = known_ports_2 | set(self._claimed_ports)
         with self._click_lock:
             status2 = open_profile_via_cdp(name, self.port)
         if status2 in ("CLICKED_OPEN", "ALREADY_OPEN"):
-            port2 = self._wait_for_cdp_port(timeout, exclude=known_ports_2)
+            port2 = self._wait_and_claim_port(timeout, exclude_set_2)
             if port2:
                 log_ok(f"CDP activo tras reinyeccion — puerto {port2}")
                 return {"name": name, "debug_port": port2, "ws_url": "",
@@ -299,6 +320,55 @@ class DICloakService:
 
         return {"name": name, "debug_port": 0, "ws_url": "",
                 "cdp_active": False, "clicked": True}
+
+    def _wait_and_claim_port(self, timeout: int, exclude: set[int]) -> int:
+        """Espera y RECLAMA atomicamente un puerto CDP nuevo.
+
+        Igual que _wait_for_cdp_port pero ademas agrega el puerto a
+        self._claimed_ports bajo self._claim_lock antes de retornarlo.
+        Si el puerto detectado ya fue reclamado por otro thread (carrera),
+        lo ignora y sigue polleando.
+        """
+        deadline = time.time() + timeout
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            candidates: list[int] = []
+
+            data = read_cdp_debug_info()
+            for entry in data.values():
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    port = int(entry.get("debugPort") or entry.get("port") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if port and port not in exclude and _test_cdp_port(port):
+                    candidates.append(port)
+
+            for prof in self.get_running_profiles():
+                rport = int(prof.get("debug_port", 0) or 0)
+                if rport and rport not in exclude and prof.get("cdp_active"):
+                    if rport not in candidates:
+                        candidates.append(rport)
+
+            # Intentar reclamar atomicamente el primer candidato no tomado
+            if candidates:
+                with self._claim_lock:
+                    for port in candidates:
+                        if port not in self._claimed_ports:
+                            self._claimed_ports.add(port)
+                            log_ok(f"CDP RECLAMADO — puerto {port} (intento {attempt}, claimed={sorted(self._claimed_ports)})")
+                            return port
+                # Todos los candidatos ya reclamados por otros threads;
+                # agregar al exclude local y seguir esperando.
+                exclude = exclude | set(candidates)
+
+            elapsed = timeout - (deadline - time.time())
+            time.sleep(0.3 if elapsed < 10 else 1)
+
+        log_warn(f"CDP no detectado tras {timeout}s ({attempt} intentos, exclude={sorted(exclude)}, claimed={sorted(self._claimed_ports)})")
+        return 0
 
     def _wait_for_cdp_port(self, timeout: int, exclude: set[int] | None = None) -> int:
         """Espera a que aparezca un puerto CDP activo NUEVO. Retorna puerto o 0.
