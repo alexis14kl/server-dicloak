@@ -44,11 +44,29 @@ POOL_URL_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
-# Locks por pool — una operacion a la vez por pool. Esto permite que image
-# y video corran en paralelo, pero serializa multiples requests del mismo
-# flujo (protege rate limiter de chatgpt y evita doble click en la misma
-# pestaña del navegador).
+# Locks por pool (legacy — mantenido para compat). Ya NO se usan como mutex
+# por pool; se reemplazaron por locks por puerto (abajo) para permitir que N
+# perfiles del mismo pool corran en paralelo.
 _pool_locks: dict[str, threading.Lock] = {p: threading.Lock() for p in POOL_URL_PATTERNS}
+
+# Locks por puerto CDP — cada perfil (identificado por su puerto) tiene su
+# propio mutex. Dos requests a perfiles distintos corren en paralelo sin
+# esperarse. Dos requests al mismo perfil (mismo puerto) se serializan para
+# evitar colisiones dentro del navegador (doble click, parseo concurrente).
+_port_locks: dict[int, threading.Lock] = {}
+_port_locks_mutex = threading.Lock()
+
+# Sem\u00e1foros por pool — limite global de paralelismo para proteger contra
+# rate limits del sitio objetivo (ChatGPT, Google Flow). Un sem\u00e1foro con
+# valor N permite N operaciones simult\u00e1neas al mismo pool; el lock por
+# puerto sigue protegiendo cada perfil individual.
+_POOL_SEMAPHORE_LIMITS = {
+    "image": 5,  # max 5 requests simult\u00e1neas a ChatGPT
+    "video": 3,  # max 3 requests simult\u00e1neas a Google Flow
+}
+_pool_semaphores: dict[str, threading.BoundedSemaphore] = {
+    p: threading.BoundedSemaphore(v) for p, v in _POOL_SEMAPHORE_LIMITS.items()
+}
 
 
 # Cache de descubrimiento (TTL corto). Evita golpear /json en cada request.
@@ -157,14 +175,44 @@ def resolve_port(pool: str, running_profiles: list[dict]) -> int:
 
 
 def acquire_pool_lock(pool: str) -> threading.Lock:
-    """Devuelve el lock del pool. Usar como context manager:
+    """LEGACY — devuelve el lock pesimista del pool.
 
-        with acquire_pool_lock("image"):
-            ...  # solo una operacion image a la vez
-
-    Operaciones de pools distintos no se bloquean entre si.
+    Mantiene compat con codigo antiguo. Preferir acquire_port_lock(port)
+    para paralelismo real por perfil, y acquire_pool_semaphore(pool) para
+    el limite de rate-limit global.
     """
     return _pool_locks[pool]
+
+
+def acquire_port_lock(port: int) -> threading.Lock:
+    """Devuelve el lock por puerto CDP. Usar como context manager:
+
+        with acquire_port_lock(9222):
+            ...  # solo una operacion a la vez en ESE perfil
+
+    Perfiles distintos tienen locks distintos → corren en paralelo.
+    El lock se crea on-demand la primera vez que se pide un puerto.
+    """
+    with _port_locks_mutex:
+        lock = _port_locks.get(port)
+        if lock is None:
+            lock = threading.Lock()
+            _port_locks[port] = lock
+        return lock
+
+
+def acquire_pool_semaphore(pool: str) -> Optional[threading.BoundedSemaphore]:
+    """Devuelve el sem\u00e1foro del pool (limite global de paralelismo).
+
+    Usar en conjunto con acquire_port_lock:
+
+        sem = acquire_pool_semaphore("image")
+        with sem, acquire_port_lock(port):
+            ...
+
+    Retorna None si el pool no tiene sem\u00e1foro configurado.
+    """
+    return _pool_semaphores.get(pool)
 
 
 def known_pools() -> tuple[str, ...]:

@@ -117,11 +117,12 @@ def public_url(path: str) -> str:
 # ── Service layer ─────────────────────────────────────────────────────────────
 
 class DICloakService:
-    # Serializa llamadas concurrentes a open_profile: la UI de DICloak es una
-    # sola ventana y _wait_for_cdp_port no distingue a qué perfil pertenece el
-    # puerto encontrado. Sin este lock dos aperturas simultáneas podrían
-    # retornar el mismo puerto o interferir en los clicks del DOM.
-    _open_lock: threading.Lock = threading.Lock()
+    # Lock CORTO que solo protege el click en la UI de DICloak (una sola
+    # ventana, dos clicks simultaneos se pisarian). La espera por el nuevo
+    # puerto CDP corre FUERA del lock para permitir aperturas en paralelo:
+    # cada caller snapshotea los puertos activos antes de clickear y luego
+    # espera a que aparezca un puerto NUEVO (no presente en el snapshot).
+    _click_lock: threading.Lock = threading.Lock()
 
     def __init__(self, dicloak_port: int = DEFAULT_DICLOAK_PORT):
         self.port = dicloak_port
@@ -180,24 +181,49 @@ class DICloakService:
             })
         return running
 
-    def open_profile(self, name: str, timeout: int = 60) -> dict:
-        # Serializar aperturas: DICloak tiene una sola UI y _wait_for_cdp_port
-        # retorna el primer puerto activo encontrado sin diferenciar perfiles.
-        # Dos llamadas simultáneas interferirían en clicks y en la espera del puerto.
-        with self._open_lock:
-            return self._open_profile_locked(name, timeout)
+    def _snapshot_active_ports(self) -> set[int]:
+        """Captura el set de puertos CDP activos en este instante.
 
-    def _open_profile_locked(self, name: str, timeout: int) -> dict:
+        Se usa ANTES de clickear un nuevo perfil para poder luego
+        diferenciar cual es el puerto nuevo que aparecio (el del perfil
+        recien abierto), permitiendo aperturas en paralelo.
+        """
+        ports: set[int] = set()
+        data = read_cdp_debug_info()
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                p = int(entry.get("debugPort") or entry.get("port") or 0)
+            except (TypeError, ValueError):
+                continue
+            if p and _test_cdp_port(p):
+                ports.add(p)
+        for prof in self.get_running_profiles():
+            rp = int(prof.get("debug_port", 0) or 0)
+            if rp and prof.get("cdp_active"):
+                ports.add(rp)
+        return ports
+
+    def open_profile(self, name: str, timeout: int = 60) -> dict:
         if not name:
             raise ValueError("El nombre del perfil es requerido.")
         if not is_dicloak_ready(self.port):
             raise ConnectionError("DICloak no responde. Verifica que este abierto.")
 
-        # Estrategia 1: Reutilizar via cdp_debug_info.json
+        # Estrategia 1: Si el perfil solicitado YA esta asociado a un puerto
+        # vivo en cdp_debug_info.json, reutilizar directo. Sin lock.
+        # NOTA: esto retorna el primer puerto encontrado en el archivo, lo
+        # cual era el bug anterior — pero solo se toma este path cuando ya
+        # hay un puerto vivo. Para paralelismo real, dos perfiles nuevos
+        # distintos pasaran de largo esta estrategia (no estan en el json).
         data = read_cdp_debug_info()
         for entry in data.values():
             if not isinstance(entry, dict):
                 continue
+            entry_name = str(entry.get("profileName") or entry.get("name") or "").strip()
+            if entry_name and entry_name != name:
+                continue  # Este port pertenece a otro perfil
             try:
                 port = int(entry.get("debugPort") or entry.get("port") or 0)
             except (TypeError, ValueError):
@@ -210,22 +236,16 @@ class DICloakService:
                     "cdp_active": True,
                 }
 
-        # Estrategia 2: Detectar ginsbrowser ya corriendo con CDP activo
-        # (cdp_debug_info.json puede estar vacio/desactualizado)
-        running = self.get_running_profiles()
-        for p in running:
-            rport = p.get("debug_port", 0)
-            if rport and p.get("cdp_active"):
-                log_ok(f"Perfil ya abierto detectado via proceso — CDP puerto {rport}")
-                return {
-                    "name": name,
-                    "debug_port": rport,
-                    "ws_url": "",
-                    "cdp_active": True,
-                }
+        # Snapshot de puertos activos ANTES del click — para detectar el
+        # puerto nuevo despues del click (permite paralelismo).
+        known_ports = self._snapshot_active_ports()
+        log_info(f"Snapshot puertos activos antes de abrir '{name}': {sorted(known_ports)}")
 
-        # Intentar abrir el perfil via CDP (click en DiCloak UI)
-        status = open_profile_via_cdp(name, self.port)
+        # Click en la UI de DiCloak — SERIALIZADO (ventana unica).
+        # El lock se libera apenas termina el click, la espera del puerto
+        # ocurre fuera para permitir aperturas concurrentes.
+        with self._click_lock:
+            status = open_profile_via_cdp(name, self.port)
 
         if status == "PROFILE_NOT_FOUND":
             available = [p.name for p in list_profiles_via_cdp(self.port)]
@@ -233,46 +253,45 @@ class DICloakService:
                 f"Perfil '{name}' no encontrado. Disponibles: {available}"
             )
 
-        # Si el perfil ya esta abierto (Ver/Abriendo), buscar su CDP directo
         if status == "ALREADY_OPEN":
             log_info(f"Perfil '{name}' ya abierto — buscando CDP...")
-            port = self._wait_for_cdp_port(timeout)
+            port = self._wait_for_cdp_port(timeout, exclude=known_ports)
             if port:
                 return {"name": name, "debug_port": port, "ws_url": "",
                         "cdp_active": True}
-            # Ya abierto pero sin CDP — reinyectar hook y esperar
             log_warn("Perfil abierto sin CDP — reinyectando hook...")
             try:
                 inject_cdp_hook(self.port)
                 time.sleep(3)
             except Exception:
                 pass
-            port = self._wait_for_cdp_port(min(timeout, 20))
+            port = self._wait_for_cdp_port(min(timeout, 20), exclude=known_ports)
             if port:
                 return {"name": name, "debug_port": port, "ws_url": "",
                         "cdp_active": True}
             return {"name": name, "debug_port": 0, "ws_url": "",
                     "cdp_active": False, "clicked": False}
 
-        # CLICKED_OPEN — se hizo click, esperar CDP
-        port = self._wait_for_cdp_port(timeout)
+        # CLICKED_OPEN — se hizo click, esperar un puerto NUEVO
+        port = self._wait_for_cdp_port(timeout, exclude=known_ports)
         if port:
             return {"name": name, "debug_port": port, "ws_url": "",
                     "cdp_active": True, "clicked": True}
 
-        # Sin CDP tras abrir: hook perdido. Reinyectar + cerrar + reabrir.
+        # Sin CDP tras abrir: reintento con reinyeccion (serializado).
         log_warn("CDP no disponible tras abrir — reinyectando hook y reabriendo...")
         try:
             inject_cdp_hook(self.port)
             time.sleep(2)
-            self.close_profiles()
-            time.sleep(3)
         except Exception:
             pass
 
-        status2 = open_profile_via_cdp(name, self.port)
+        # Re-snapshot por si algo cambio; luego reclick serializado.
+        known_ports_2 = self._snapshot_active_ports()
+        with self._click_lock:
+            status2 = open_profile_via_cdp(name, self.port)
         if status2 in ("CLICKED_OPEN", "ALREADY_OPEN"):
-            port2 = self._wait_for_cdp_port(timeout)
+            port2 = self._wait_for_cdp_port(timeout, exclude=known_ports_2)
             if port2:
                 log_ok(f"CDP activo tras reinyeccion — puerto {port2}")
                 return {"name": name, "debug_port": port2, "ws_url": "",
@@ -281,12 +300,17 @@ class DICloakService:
         return {"name": name, "debug_port": 0, "ws_url": "",
                 "cdp_active": False, "clicked": True}
 
-    def _wait_for_cdp_port(self, timeout: int) -> int:
-        """Espera a que aparezca un puerto CDP activo. Retorna puerto o 0.
+    def _wait_for_cdp_port(self, timeout: int, exclude: set[int] | None = None) -> int:
+        """Espera a que aparezca un puerto CDP activo NUEVO. Retorna puerto o 0.
 
-        Polling agresivo: empieza cada 0.3s los primeros 10s,
-        luego cada 1s hasta agotar el timeout completo.
+        Args:
+            timeout: segundos a esperar.
+            exclude: set de puertos ya conocidos (snapshot antes del click).
+                Solo se retornan puertos que NO esten en este set — asi dos
+                llamadas concurrentes a open_profile pueden detectar cada una
+                su propio puerto recien creado sin pisarse.
         """
+        exclude = exclude or set()
         deadline = time.time() + timeout
         attempt = 0
         while time.time() < deadline:
@@ -300,20 +324,20 @@ class DICloakService:
                     port = int(entry.get("debugPort") or entry.get("port") or 0)
                 except (TypeError, ValueError):
                     continue
-                if port and _test_cdp_port(port):
-                    log_ok(f"CDP detectado via cdp_debug_info — puerto {port} (intento {attempt})")
+                if port and port not in exclude and _test_cdp_port(port):
+                    log_ok(f"CDP NUEVO via cdp_debug_info — puerto {port} (intento {attempt})")
                     return port
             # Via proceso (fallback — busca ginsbrowser con --remote-debugging-port)
             running = self.get_running_profiles()
             for p in running:
-                rport = p.get("debug_port", 0)
-                if rport and p.get("cdp_active"):
-                    log_ok(f"CDP detectado via proceso — puerto {rport} (intento {attempt})")
+                rport = int(p.get("debug_port", 0) or 0)
+                if rport and rport not in exclude and p.get("cdp_active"):
+                    log_ok(f"CDP NUEVO via proceso — puerto {rport} (intento {attempt})")
                     return rport
             # Polling agresivo los primeros 10s, luego más relajado
             elapsed = timeout - (deadline - time.time())
             time.sleep(0.3 if elapsed < 10 else 1)
-        log_warn(f"CDP no detectado tras {timeout}s de polling ({attempt} intentos)")
+        log_warn(f"CDP no detectado tras {timeout}s de polling ({attempt} intentos, exclude={sorted(exclude)})")
         return 0
 
     def close_profiles(self) -> int:
@@ -712,13 +736,13 @@ def inject_hook():
 @app.post("/chatgpt/stabilize")
 def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
     """Estabiliza ChatGPT: cierra tabs duplicadas, deja 1 sola lista para generar."""
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "image")
         if err:
             return error_response(err, 503)
 
-        with acquire_pool_lock("image"):
+        with acquire_pool_semaphore("image"), acquire_port_lock(port):
             from chat_gpt_consulta.stabilize import stabilize_chatgpt
             result = stabilize_chatgpt(port=port, timeout=req.timeout)
         if result.get("success"):
@@ -730,7 +754,7 @@ def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
 
 @app.post("/chatgpt/prompt")
 def chatgpt_prompt(req: PromptRequest):
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "image")
         if err:
@@ -738,7 +762,7 @@ def chatgpt_prompt(req: PromptRequest):
 
         # Lock del pool image — serializa peticiones del flujo de imagenes,
         # pero no bloquea peticiones del pool video (que corren en paralelo).
-        with acquire_pool_lock("image"):
+        with acquire_pool_semaphore("image"), acquire_port_lock(port):
             return _chatgpt_prompt_locked(req, port)
     except Exception as e:
         return error_response(str(e), 500)
@@ -840,12 +864,12 @@ def _chatgpt_prompt_locked(req: PromptRequest, port: int):
 
 @app.post("/chatgpt/send-pasted")
 def chatgpt_send_pasted(req: SendPastedPromptRequest):
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "image")
         if err:
             return error_response(err, 503)
-        with acquire_pool_lock("image"):
+        with acquire_pool_semaphore("image"), acquire_port_lock(port):
             from chat_gpt_consulta.prompt_paste import send_pasted_prompt
             result = send_pasted_prompt(
                 port=port,
@@ -863,12 +887,12 @@ def chatgpt_send_pasted(req: SendPastedPromptRequest):
 
 @app.post("/veo3/stabilize")
 def veo3_stabilize(req: Veo3StabilizeRequest):
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "video")
         if err:
             return error_response(err, 503)
-        with acquire_pool_lock("video"):
+        with acquire_pool_semaphore("video"), acquire_port_lock(port):
             from chat_veo3_videos.veo3_session import navigate_and_stabilize
             result = navigate_and_stabilize(port=port, timeout=req.timeout)
         if result.get("success"):
@@ -883,12 +907,12 @@ class Veo3NewProjectRequest(BaseModel):
 
 @app.post("/veo3/new-project")
 def veo3_new_project(req: Veo3NewProjectRequest):
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "video")
         if err:
             return error_response(err, 503)
-        with acquire_pool_lock("video"):
+        with acquire_pool_semaphore("video"), acquire_port_lock(port):
             from chat_veo3_videos.veo3_session import open_new_project
             result = open_new_project(port=port, prompt=req.prompt)
         if result.get("success"):
@@ -907,12 +931,12 @@ def veo3_new_project(req: Veo3NewProjectRequest):
 
 @app.post("/veo3/download-video")
 def veo3_download_video(req: Veo3DownloadVideoRequest):
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "video")
         if err:
             return error_response(err, 503)
-        with acquire_pool_lock("video"):
+        with acquire_pool_semaphore("video"), acquire_port_lock(port):
             from chat_veo3_videos.exten_video import download_extended_video
             result = download_extended_video(
                 port=port,
@@ -937,13 +961,13 @@ def chatgpt_download_image(req: ImageDownloadRequest):
     # Al terminar (en cualquier branch), limpiamos la bandera del registry
     # para que el set no crezca indefinidamente entre ejecuciones.
     from cancellation import clear as clear_cancel_flag, JobCancelled
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "image")
         if err:
             return error_response(err, 503)
 
-        with acquire_pool_lock("image"):
+        with acquire_pool_semaphore("image"), acquire_port_lock(port):
             from chat_gpt_consulta.image_download import wait_and_download_image
             # Siempre guardar en el directorio propio del servidor
             result = wait_and_download_image(
@@ -982,12 +1006,12 @@ def chatgpt_download_image(req: ImageDownloadRequest):
 
 @app.post("/veo3/extend-video")
 def veo3_extend_video(req: Veo3ExtendVideoRequest):
-    from profile_pool import acquire_pool_lock
+    from profile_pool import acquire_port_lock, acquire_pool_semaphore
     try:
         port, err = resolve_pool_port(req.port, "video")
         if err:
             return error_response(err, 503)
-        with acquire_pool_lock("video"):
+        with acquire_pool_semaphore("video"), acquire_port_lock(port):
             from chat_veo3_videos.exten_video import extend_video
             result = extend_video(port=port, prompt=req.prompt)
         if result.get("success"):
