@@ -1,24 +1,73 @@
 """
 Account State — Estado persistente de cuentas ChatGPT agotadas.
 
-Centralizado en MySQL (tabla account_rotation), compartida con Django.
-Reemplaza el antiguo .account_rotation_state.json.
+Primario: MySQL (tabla account_rotation), compartida con Django.
+Fallback: archivo JSON local cuando MySQL no está disponible.
 
 TTL: 4 horas por cuenta agotada (configurable via env ACCOUNT_ROTATION_TTL_SEC).
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 STATE_TTL_SEC = int(os.environ.get("ACCOUNT_ROTATION_TTL_SEC", str(4 * 60 * 60)))
+
+_FALLBACK_FILE = Path(__file__).resolve().parent.parent / "output" / ".account_state.json"
+
+
+# ── Fallback JSON ─────────────────────────────────────────────────────────────
+
+def _load_fallback() -> dict:
+    try:
+        if _FALLBACK_FILE.exists():
+            return json.loads(_FALLBACK_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_fallback(data: dict) -> None:
+    try:
+        _FALLBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _FALLBACK_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as e:
+        sys.stderr.write(f"[account_state] fallback write error: {e}\n")
+
+
+def _fallback_get_exhausted(port: int) -> set[str]:
+    prefix = f"chatgpt:{port}:"
+    now = time.time()
+    data = _load_fallback()
+    return {k[len(prefix):] for k, v in data.items() if k.startswith(prefix) and v > now}
+
+
+def _fallback_mark_exhausted(port: int, account_id: str) -> None:
+    if not account_id:
+        return
+    key = f"chatgpt:{port}:{account_id}"
+    data = _load_fallback()
+    data[key] = time.time() + STATE_TTL_SEC
+    _save_fallback(data)
+
+
+def _fallback_clear_exhausted(port: int, account_id: str) -> None:
+    if not account_id:
+        return
+    key = f"chatgpt:{port}:{account_id}"
+    data = _load_fallback()
+    data.pop(key, None)
+    _save_fallback(data)
+
 
 # ── Conexión MySQL ────────────────────────────────────────────────────────────
 
 def _get_conn():
-    """Abre una conexión MySQL usando las variables del .env (ya cargadas por server.py)."""
+    """Abre una conexión MySQL usando las variables del .env."""
     import pymysql
 
     return pymysql.connect(
@@ -56,7 +105,8 @@ def get_exhausted_ids(port: int) -> set[str]:
         return {row[0][len(prefix):] for row in rows}
     except Exception as e:
         sys.stderr.write(f"[account_state] get_exhausted_ids error: {e}\n")
-        return set()
+        sys.stderr.write("[account_state] usando fallback JSON\n")
+        return _fallback_get_exhausted(port)
 
 
 def mark_exhausted(port: int, account_id: str, label: str = "") -> None:
@@ -78,6 +128,8 @@ def mark_exhausted(port: int, account_id: str, label: str = "") -> None:
         conn.close()
     except Exception as e:
         sys.stderr.write(f"[account_state] mark_exhausted error: {e}\n")
+        sys.stderr.write("[account_state] usando fallback JSON\n")
+        _fallback_mark_exhausted(port, account_id)
 
 
 def clear_exhausted(port: int, account_id: str) -> None:
@@ -92,6 +144,7 @@ def clear_exhausted(port: int, account_id: str) -> None:
         conn.close()
     except Exception as e:
         sys.stderr.write(f"[account_state] clear_exhausted error: {e}\n")
+        _fallback_clear_exhausted(port, account_id)
 
 
 def get_exhausted_ids_fallback(port: int) -> set[str]:
