@@ -186,6 +186,36 @@ class DICloakService:
             })
         return running
 
+    def close_profile_by_port(self, port: int) -> bool:
+        """Cierra SOLO el perfil cuyo ginsbrowser escucha en `port`.
+
+        A diferencia de close_profiles() (que mata TODOS los ginsbrowser),
+        esto busca el PID correspondiente en get_running_profiles y lo mata
+        individualmente. Seguro usar mientras otros perfiles estan corriendo.
+        """
+        running = self.get_running_profiles()
+        target_pid = 0
+        for p in running:
+            if int(p.get("debug_port", 0) or 0) == int(port):
+                target_pid = int(p.get("pid", 0) or 0)
+                break
+        if not target_pid:
+            log_warn(f"[close_by_port] no se encontro PID para puerto {port}")
+            return False
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(target_pid)],
+                    capture_output=True, timeout=5,
+                )
+            else:
+                os.kill(target_pid, 9)
+            log_warn(f"[close_by_port] perfil en puerto {port} (pid {target_pid}) cerrado")
+            return True
+        except Exception as e:
+            log_warn(f"[close_by_port] error cerrando pid {target_pid}: {e}")
+            return False
+
     def _snapshot_active_ports(self) -> set[int]:
         """Captura el set de puertos CDP activos en este instante.
 
@@ -740,55 +770,80 @@ def running_profiles():
 
 @app.get("/pools")
 def pools_status():
-    """Estado del routing por pool (debug). Muestra que perfiles activos
-    estan en cada pool y que locks estan ocupados ahora mismo.
+    """Estado del routing por pool (debug).
 
-    Util para verificar que el orchestrator abrio los perfiles correctos
-    (uno con chatgpt.com, otro con labs.google) y que las peticiones
-    concurrentes estan tomando los locks que esperabamos.
+    Reporta:
+      * pools[].ports — puertos CDP clasificados a cada pool
+      * pools[].semaphore — capacidad total / usada del semaforo del pool
+      * pools[].url_patterns — dominios usados para clasificar
+      * pools[].exhausted_ports — puertos marcados profile_exhausted
+      * running_profiles[] — cada perfil corriendo con su pool asignado
+                             y si el lock por-puerto esta ocupado en este momento
     """
     try:
         from profile_pool import (
-            discover_pools, classify_port, _pool_locks, known_pools,
-            POOL_URL_PATTERNS,
+            discover_pools, classify_port, known_pools, POOL_URL_PATTERNS,
+            _pool_semaphores, _port_locks, _port_locks_mutex,
+            list_exhausted_ports, is_port_exhausted,
         )
         running = service.get_running_profiles()
         mapping = discover_pools(running, force=True)
+        exhausted_all = set(list_exhausted_ports())
 
-        # Detalle por puerto: incluir si el lock del pool esta tomado.
-        # acquire(blocking=False) es no destructivo: si el lock esta libre lo
-        # toma momentaneamente y lo suelta inmediatamente; si esta tomado
-        # devuelve False sin bloquear.
         pools_info = {}
         for pool_name in known_pools():
-            lock = _pool_locks[pool_name]
-            acquired = lock.acquire(blocking=False)
-            if acquired:
-                lock.release()
-                lock_busy = False
-            else:
-                lock_busy = True
+            sem = _pool_semaphores.get(pool_name)
+            capacity = None
+            free = None
+            if sem is not None:
+                # BoundedSemaphore expone ._initial_value (capacity) y ._value (free).
+                # Son atributos internos pero estables en CPython — aceptable para debug.
+                capacity = getattr(sem, "_initial_value", None)
+                free = getattr(sem, "_value", None)
+            pool_ports = mapping.get(pool_name, [])
             pools_info[pool_name] = {
-                "ports": mapping.get(pool_name, []),
-                "lock_busy": lock_busy,
+                "ports": pool_ports,
                 "url_patterns": list(POOL_URL_PATTERNS[pool_name]),
+                "semaphore": {
+                    "capacity": capacity,
+                    "free": free,
+                    "in_use": (capacity - free) if capacity is not None and free is not None else None,
+                },
+                "exhausted_ports": sorted(exhausted_all & set(pool_ports)),
             }
 
-        # Detalle por puerto running: que pool quedo asignado (o None)
+        # Snapshot de los port_locks (no destructivo). Solo reportamos los
+        # puertos que aparecen en running_profiles para no polucionar con locks
+        # de puertos viejos.
         running_detail = []
+        with _port_locks_mutex:
+            port_locks_snapshot = dict(_port_locks)
         for prof in running:
-            port = prof.get("debug_port", 0)
+            port = int(prof.get("debug_port", 0) or 0)
+            lock = port_locks_snapshot.get(port)
+            if lock is None:
+                port_lock_busy = False
+            else:
+                got = lock.acquire(blocking=False)
+                if got:
+                    lock.release()
+                    port_lock_busy = False
+                else:
+                    port_lock_busy = True
             running_detail.append({
                 "pid": prof.get("pid", 0),
                 "debug_port": port,
                 "cdp_active": prof.get("cdp_active", False),
                 "classified_pool": classify_port(port) if prof.get("cdp_active") else None,
+                "port_lock_busy": port_lock_busy,
+                "exhausted": port in exhausted_all,
             })
 
         return success_response(data={
             "pools": pools_info,
             "running_profiles": running_detail,
             "total_running": len(running),
+            "exhausted_ports": sorted(exhausted_all),
         }, message="Estado de pools")
     except Exception as e:
         return error_response(str(e), 500)
@@ -854,18 +909,97 @@ def chatgpt_stabilize(req: ChatGPTStabilizeRequest):
 
 @app.post("/chatgpt/prompt")
 def chatgpt_prompt(req: PromptRequest):
-    from profile_pool import acquire_port_lock, acquire_pool_semaphore
+    """POST /chatgpt/prompt con auto-rotacion de perfiles.
+
+    Si un perfil se queda sin tokens y OpenAI deshabilito el submenu de
+    rotacion de cuentas, el worker interno devuelve profile_exhausted. Aqui
+    capturamos ese error, marcamos el puerto como agotado, cerramos ese
+    ginsbrowser, y reintentamos con otro perfil del pool image. Si no hay
+    otro, devolvemos 429 al orchestrator para que abra uno nuevo.
+    """
+    from profile_pool import (
+        acquire_port_lock,
+        acquire_pool_semaphore,
+        mark_port_exhausted,
+        resolve_port,
+    )
+
+    MAX_PROFILE_ROTATIONS = 3  # cuantos perfiles agotados aceptamos antes de rendirnos
+    tried_ports: set[int] = set()
+
     try:
         port, err = resolve_pool_port(req.port, "image")
         if err:
             return error_response(err, 503)
 
-        # Lock del pool image — serializa peticiones del flujo de imagenes,
-        # pero no bloquea peticiones del pool video (que corren en paralelo).
-        with acquire_pool_semaphore("image"), acquire_port_lock(port):
-            return _chatgpt_prompt_locked(req, port)
+        for attempt in range(MAX_PROFILE_ROTATIONS):
+            tried_ports.add(port)
+            with acquire_pool_semaphore("image"), acquire_port_lock(port):
+                inner = _chatgpt_prompt_locked(req, port)
+
+            # _chatgpt_prompt_locked devuelve un Response. Parseamos el body
+            # para decidir si es profile_exhausted y debemos rotar de perfil.
+            body = _safe_parse_response(inner)
+            is_profile_exhausted = (
+                body.get("success") is False
+                and (body.get("error") == "profile_exhausted"
+                     or (body.get("details") or {}).get("error") == "profile_exhausted")
+            )
+
+            if not is_profile_exhausted:
+                return inner
+
+            # Este perfil se agoto. Marcarlo, cerrarlo y buscar otro.
+            log_warn(f"[pool/image] perfil en puerto {port} agotado — cerrando y buscando otro (intento {attempt + 1}/{MAX_PROFILE_ROTATIONS})")
+            mark_port_exhausted(port)
+            try:
+                service.close_profile_by_port(port)
+            except Exception as e:
+                log_warn(f"[pool/image] close_profile_by_port fallo: {e}")
+
+            running = service.get_running_profiles()
+            next_port = resolve_port("image", running, exclude=tried_ports)
+            if not next_port:
+                log_warn("[pool/image] no hay otro perfil image disponible — orchestrator debe abrir uno nuevo")
+                return error_response(
+                    "profile_exhausted",
+                    429,
+                    details={
+                        "exhausted_ports": sorted(tried_ports),
+                        "rotations": attempt + 1,
+                        "hint": "Todos los perfiles ChatGPT disponibles estan agotados. Abrir un perfil nuevo via /profiles/open.",
+                        "last_inner_error": body,
+                    },
+                )
+
+            log_ok(f"[pool/image] reintentando con puerto {next_port}")
+            port = next_port
+
+        # Agotamos MAX_PROFILE_ROTATIONS sin exito
+        return error_response(
+            "profile_exhausted_max_rotations",
+            429,
+            details={
+                "exhausted_ports": sorted(tried_ports),
+                "rotations": MAX_PROFILE_ROTATIONS,
+                "hint": f"Se probaron {MAX_PROFILE_ROTATIONS} perfiles sin exito. Abrir uno nuevo.",
+            },
+        )
     except Exception as e:
         return error_response(str(e), 500)
+
+
+def _safe_parse_response(resp) -> dict:
+    """Extrae el JSON body de una Response de FastAPI. Devuelve {} si falla."""
+    try:
+        raw = getattr(resp, "body", None)
+        if raw is None:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        return _json.loads(raw)
+    except Exception:
+        return {}
 
 
 def _chatgpt_prompt_locked(req: PromptRequest, port: int):

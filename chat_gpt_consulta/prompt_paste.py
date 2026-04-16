@@ -1284,6 +1284,27 @@ def send_pasted_prompt(
 
 MAX_ROTATION_ATTEMPTS = 5
 
+# Reasons de switch_account() que indican que NO se puede rotar dentro del
+# mismo perfil (OpenAI deshabilito el submenu o no hay candidatos). Estos
+# deben propagarse como `profile_exhausted` para que el endpoint reaccione.
+_PROFILE_EXHAUSTED_REASONS = frozenset({
+    "no_candidates",
+    "accounts_submenu_missing",
+    "accounts_submenu_not_opened",
+})
+
+
+def _profile_exhausted_result(switch_result: dict, rotations: int) -> dict:
+    reason = switch_result.get("reason", "unknown")
+    return {
+        "success": False,
+        "error": "profile_exhausted",
+        "message": f"Perfil sin rotacion disponible ({reason}) — cerrar y abrir otro",
+        "rotations": rotations,
+        "reason": reason,
+        "available_count": switch_result.get("available_count", 0),
+    }
+
 
 def _rate_limited_result(session: ChatGPTSession, rotations: int = 0) -> dict:
     """Respuesta estándar cuando ChatGPT activa el rate limit temporal."""
@@ -1347,6 +1368,8 @@ def paste_and_send_with_rotation(
                         log_ok(f"Rotación #{rotations} tras rate limit en page_ready.")
                         time.sleep(3)
                         continue
+                    if switch_result.get("reason") in _PROFILE_EXHAUSTED_REASONS:
+                        return _profile_exhausted_result(switch_result, rotations)
                     return _rate_limited_result(session, rotations=rotations)
                 return {"success": False, "error": "ChatGPT no cargó completamente"}
 
@@ -1376,6 +1399,8 @@ def paste_and_send_with_rotation(
                         log_ok(f"Rotación #{rotations} tras rate limit en envío.")
                         time.sleep(3)
                         continue
+                    if switch_result.get("reason") in _PROFILE_EXHAUSTED_REASONS:
+                        return _profile_exhausted_result(switch_result, rotations)
                     return _rate_limited_result(session, rotations=rotations)
                 return {"success": False, "error": "No se pudo enviar el prompt"}
 
@@ -1427,7 +1452,12 @@ def paste_and_send_with_rotation(
                     log_ok(f"Rotación #{rotations} tras rate limit: {switch_result.get('account_label', '')}")
                     time.sleep(3)
                     continue  # reintentar con la nueva cuenta
-                # Sin cuentas disponibles para rotar → rate limit real
+                # Sin cuentas disponibles para rotar. Si la razon indica que la UI
+                # de rotacion no existe, es profile_exhausted — el endpoint cerrara
+                # el perfil y buscara otro.
+                if switch_result.get("reason") in _PROFILE_EXHAUSTED_REASONS:
+                    log_warn(f"Rotacion no disponible ({switch_result.get('reason')}) — perfil agotado")
+                    return _profile_exhausted_result(switch_result, rotations)
                 log_warn("Sin cuentas disponibles para rotar tras rate limit.")
                 return _rate_limited_result(session, rotations=rotations)
 
@@ -1444,19 +1474,19 @@ def paste_and_send_with_rotation(
             last_account_label = ""
 
             if not switch_result.get("switched"):
-                reason = switch_result.get("reason", "unknown")
-                error_code = "all_accounts_exhausted" if reason == "no_candidates" else "account_switch_ui_failed"
-                message = (
-                    f"Sin cuentas disponibles: {reason}"
-                    if error_code == "all_accounts_exhausted"
-                    else f"Falló la UI de cambio de cuenta: {reason}"
-                )
+                # OpenAI deshabilito la rotacion en muchos planes: las cuentas
+                # alternativas aparecen como "DESACTIVADO" o el submenu de
+                # cambio no existe. Si la razon del fallo indica eso, lo
+                # reportamos como `profile_exhausted` — el endpoint
+                # /chatgpt/prompt lo captura, cierra el perfil y busca otro.
+                if switch_result.get("reason") in _PROFILE_EXHAUSTED_REASONS:
+                    return _profile_exhausted_result(switch_result, rotations)
                 return {
                     "success": False,
-                    "error": error_code,
-                    "message": message,
+                    "error": "account_switch_ui_failed",
+                    "message": f"Fallo la UI de cambio de cuenta: {switch_result.get('reason', 'unknown')}",
                     "rotations": rotations,
-                    "reason": reason,
+                    "reason": switch_result.get("reason", "unknown"),
                     "available_count": switch_result.get("available_count", 0),
                 }
 

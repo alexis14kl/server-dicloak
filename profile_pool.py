@@ -77,6 +77,42 @@ _pool_to_ports: dict[str, list[int]] = {p: [] for p in POOL_URL_PATTERNS}
 _port_to_pool: dict[int, str] = {}
 
 
+# Registry de puertos marcados como "agotados" — perfiles cuya cuenta activa
+# se quedo sin tokens y no pueden rotar (OpenAI deshabilito el submenu de
+# rotacion). Estos puertos se excluyen de resolve_port() hasta que:
+#   - el proceso ginsbrowser correspondiente desaparece (get_running_profiles
+#     deja de verlo, auto-limpieza en discover_pools)
+#   - alguien llama a unmark_port_exhausted(port) / clear_exhausted_ports()
+_exhausted_ports: set[int] = set()
+_exhausted_lock = threading.Lock()
+
+
+def mark_port_exhausted(port: int) -> None:
+    """Marca un puerto como agotado. Queda fuera del routing del pool."""
+    with _exhausted_lock:
+        _exhausted_ports.add(port)
+
+
+def is_port_exhausted(port: int) -> bool:
+    with _exhausted_lock:
+        return port in _exhausted_ports
+
+
+def unmark_port_exhausted(port: int) -> None:
+    with _exhausted_lock:
+        _exhausted_ports.discard(port)
+
+
+def clear_exhausted_ports() -> None:
+    with _exhausted_lock:
+        _exhausted_ports.clear()
+
+
+def list_exhausted_ports() -> list[int]:
+    with _exhausted_lock:
+        return sorted(_exhausted_ports)
+
+
 def _list_targets(port: int) -> list[dict]:
     """Devuelve los targets CDP del puerto, o lista vacia si el puerto no responde."""
     try:
@@ -145,33 +181,54 @@ def discover_pools(running_profiles: list[dict], force: bool = False) -> dict[st
         _pool_to_ports = new_map
         _port_to_pool = new_inv
         _last_discovery_at = now
+        # Auto-limpieza: si un puerto agotado ya no aparece entre los ginsbrowser
+        # corriendo (fue cerrado), liberar su marca para que si vuelve a abrirse
+        # (ej: orchestrator abrio otro perfil) no quede bloqueado.
+        currently_running = {
+            int(p.get("debug_port", 0) or 0) for p in running_profiles
+        }
+        with _exhausted_lock:
+            stale = _exhausted_ports - currently_running
+            if stale:
+                _exhausted_ports.difference_update(stale)
+                log_info(f"[pool] exhausted auto-limpiados (perfiles cerrados): {sorted(stale)}")
         log_info(f"[pool] descubrimiento: {dict(new_map)}")
         return {k: list(v) for k, v in new_map.items()}
 
 
-def resolve_port(pool: str, running_profiles: list[dict]) -> int:
+def resolve_port(pool: str, running_profiles: list[dict], exclude: set[int] | None = None) -> int:
     """Devuelve un puerto activo del pool, o 0 si no hay disponibles.
 
     Estrategia:
       1. Intenta con el cache (descubre si esta expirado).
       2. Verifica que el puerto del cache sigue vivo via _test_cdp_port.
-      3. Si nada vivo, fuerza un re-descubrimiento.
-      4. Si aun nada, retorna 0.
+      3. Salta puertos marcados como agotados (is_port_exhausted) o en la
+         lista `exclude` pasada por el caller (para retries).
+      4. Si nada vivo, fuerza un re-descubrimiento.
+      5. Si aun nada, retorna 0.
     """
     if pool not in POOL_URL_PATTERNS:
         return 0
 
+    skip = set(exclude or ())
+
+    def _pick(m: dict[str, list[int]]) -> int:
+        for p in m.get(pool, []):
+            if p in skip:
+                continue
+            if is_port_exhausted(p):
+                continue
+            if _test_cdp_port(p):
+                return p
+        return 0
+
     mapping = discover_pools(running_profiles, force=False)
-    for p in mapping.get(pool, []):
-        if _test_cdp_port(p):
-            return p
+    found = _pick(mapping)
+    if found:
+        return found
 
     mapping = discover_pools(running_profiles, force=True)
-    for p in mapping.get(pool, []):
-        if _test_cdp_port(p):
-            return p
-
-    return 0
+    return _pick(mapping)
 
 
 def acquire_pool_lock(pool: str) -> threading.Lock:

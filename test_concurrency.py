@@ -181,10 +181,14 @@ def test_pools_endpoint():
     assert "image" in pools and "video" in pools
     assert FAKE_IMAGE_PORT in pools["image"]["ports"], f"image ports: {pools['image']['ports']}"
     assert FAKE_VIDEO_PORT in pools["video"]["ports"], f"video ports: {pools['video']['ports']}"
-    assert pools["image"]["lock_busy"] is False
-    assert pools["video"]["lock_busy"] is False
+    # Semaforos: ambos libres (capacity == free)
+    assert pools["image"]["semaphore"]["free"] == pools["image"]["semaphore"]["capacity"]
+    assert pools["video"]["semaphore"]["free"] == pools["video"]["semaphore"]["capacity"]
+    assert pools["image"]["exhausted_ports"] == []
+    assert pools["video"]["exhausted_ports"] == []
     print(f"  pools.image.ports = {pools['image']['ports']}")
     print(f"  pools.video.ports = {pools['video']['ports']}")
+    print(f"  pools.image.semaphore = {pools['image']['semaphore']}")
     print(f"  total_running = {data['total_running']}")
     print("  PASS")
 
@@ -198,15 +202,17 @@ def test_resolve_routing_correct_pool():
     print("  PASS")
 
 
-def test_resolve_routing_wrong_pool_redirects():
-    print("\n[TEST 3] resolve_pool_port: puerto del pool equivocado se redirige")
-    # Cliente manda puerto video a endpoint que pide image
+def test_resolve_routing_trusts_client_port():
+    print("\n[TEST 3] resolve_pool_port confia en el puerto del cliente (Django reserva upfront)")
+    # Diseño actual (trust-client): el server confia en lo que Django reservo.
+    # Si el puerto del cliente esta vivo, se usa tal cual sin reclasificar.
+    # Incluso si el "pool" del endpoint no machea, el server respeta el port.
+    # Es responsabilidad del orchestrator mandar el puerto correcto al endpoint correcto.
     p, err = server.resolve_pool_port(FAKE_VIDEO_PORT, "image")
-    assert err == "" and p == FAKE_IMAGE_PORT, f"esperado redirect a {FAKE_IMAGE_PORT}, got ({p}, {err!r})"
-    # Y al reves
+    assert err == "" and p == FAKE_VIDEO_PORT, f"esperado trust a {FAKE_VIDEO_PORT}, got ({p}, {err!r})"
     p, err = server.resolve_pool_port(FAKE_IMAGE_PORT, "video")
-    assert err == "" and p == FAKE_VIDEO_PORT, f"esperado redirect a {FAKE_VIDEO_PORT}, got ({p}, {err!r})"
-    print("  PASS — image->video y viceversa redirige correctamente")
+    assert err == "" and p == FAKE_IMAGE_PORT, f"esperado trust a {FAKE_IMAGE_PORT}, got ({p}, {err!r})"
+    print("  PASS — el server confia en el puerto del cliente sin reclasificar")
 
 
 def test_resolve_routing_dead_port():
@@ -359,11 +365,11 @@ def test_mixed_burst_three_image_one_video():
     print("  PASS — los image se serializan, el video corre en paralelo")
 
 
-def test_pools_endpoint_shows_lock_busy_during_request():
-    print("\n[TEST 9] /pools muestra lock_busy=True durante un request en vuelo")
+def test_pools_endpoint_shows_port_lock_and_semaphore_in_use():
+    print("\n[TEST 9] /pools refleja port_lock_busy y semaphore.in_use durante request")
     reset_log()
 
-    busy_during_request: dict[str, bool] = {}
+    busy: dict[str, object] = {}
 
     def slow_request():
         client.post("/chatgpt/prompt", json={"port": FAKE_IMAGE_PORT, "prompt": "p", "auto_rotate": False})
@@ -373,19 +379,200 @@ def test_pools_endpoint_shows_lock_busy_during_request():
         time.sleep(0.15)  # dejar que el request entre y tome el lock
         r = client.get("/pools")
         data = r.json()["data"]
-        busy_during_request["image"] = data["pools"]["image"]["lock_busy"]
-        busy_during_request["video"] = data["pools"]["video"]["lock_busy"]
+        busy["image_sem_in_use"] = data["pools"]["image"]["semaphore"]["in_use"]
+        busy["video_sem_in_use"] = data["pools"]["video"]["semaphore"]["in_use"]
+        # port lock del perfil image en uso
+        image_entry = next(p for p in data["running_profiles"] if p["debug_port"] == FAKE_IMAGE_PORT)
+        video_entry = next(p for p in data["running_profiles"] if p["debug_port"] == FAKE_VIDEO_PORT)
+        busy["image_port_lock"] = image_entry["port_lock_busy"]
+        busy["video_port_lock"] = video_entry["port_lock_busy"]
         future.result(timeout=10)
 
-    print(f"  Durante request: image lock_busy={busy_during_request['image']}, video={busy_during_request['video']}")
-    assert busy_during_request["image"] is True, "image lock deberia estar tomado durante el request"
-    assert busy_during_request["video"] is False, "video lock no deberia estar tomado"
+    print(f"  image: port_lock={busy['image_port_lock']} sem_in_use={busy['image_sem_in_use']}")
+    print(f"  video: port_lock={busy['video_port_lock']} sem_in_use={busy['video_sem_in_use']}")
+    assert busy["image_port_lock"] is True, "image port_lock deberia estar tomado durante el request"
+    assert busy["video_port_lock"] is False, "video port_lock no deberia estar tomado"
+    assert busy["image_sem_in_use"] >= 1, "image semaphore deberia reportar al menos 1 en uso"
 
     # Despues del request, ambos libres
     r = client.get("/pools")
-    after = r.json()["data"]["pools"]
-    assert after["image"]["lock_busy"] is False
-    print("  PASS — /pools refleja correctamente el estado del lock en vivo")
+    after = r.json()["data"]
+    assert after["pools"]["image"]["semaphore"]["in_use"] == 0
+    image_entry = next(p for p in after["running_profiles"] if p["debug_port"] == FAKE_IMAGE_PORT)
+    assert image_entry["port_lock_busy"] is False
+    print("  PASS — /pools refleja port_lock y semaphore en tiempo real")
+
+
+def test_profile_exhausted_retry_closes_and_retries():
+    """Simula un perfil ChatGPT agotado (rotacion deshabilitada) y verifica que
+    el endpoint cierra ese perfil y reintenta con otro del pool."""
+    print("\n[TEST 11] profile_exhausted -> cierra perfil y reintenta con otro del pool")
+    reset_log()
+
+    # Preparar 2 perfiles image simulados (ademas del video).
+    IMAGE_PORT_A = FAKE_IMAGE_PORT          # este va a fallar (profile_exhausted)
+    IMAGE_PORT_B = 19060                    # este va a funcionar
+
+    original_running = list(_fake_running)
+    original_classify = profile_pool.classify_port
+    original_test_cdp = profile_pool._test_cdp_port
+    original_test_cdp_server = server._test_cdp_port
+    original_test_cdp_bridge = cdp_bridge._test_cdp_port
+    original_chatgpt_locked = server._chatgpt_prompt_locked
+    original_close = server.service.close_profile_by_port
+    original_get_running = server.service.get_running_profiles
+
+    # Extender el fake running con el nuevo puerto
+    extended_running = [
+        {"pid": 1001, "debug_port": IMAGE_PORT_A, "cdp_active": True},
+        {"pid": 1002, "debug_port": FAKE_VIDEO_PORT, "cdp_active": True},
+        {"pid": 1003, "debug_port": IMAGE_PORT_B, "cdp_active": True},
+    ]
+
+    # Estado mutable: cuando el test cierra IMAGE_PORT_A, lo removemos del running
+    running_state = {"profiles": extended_running}
+    close_log: list[int] = []
+
+    def fake_get_running():
+        return list(running_state["profiles"])
+
+    def fake_close_by_port(self_or_port, port=None):
+        # Soporta ambos: metodo bound (self, port) o lambda(port)
+        p = port if port is not None else self_or_port
+        close_log.append(p)
+        running_state["profiles"] = [
+            prof for prof in running_state["profiles"]
+            if prof["debug_port"] != p
+        ]
+        return True
+
+    def fake_classify(port):
+        if port in (IMAGE_PORT_A, IMAGE_PORT_B):
+            return "image"
+        if port == FAKE_VIDEO_PORT:
+            return "video"
+        return None
+
+    def fake_test_cdp(port):
+        return any(prof["debug_port"] == port for prof in running_state["profiles"])
+
+    # _chatgpt_prompt_locked:
+    # - primera llamada (port A) devuelve profile_exhausted
+    # - segunda llamada (port B) devuelve success
+    call_log: list[int] = []
+    def fake_chatgpt_locked(req, port):
+        call_log.append(port)
+        if port == IMAGE_PORT_A:
+            result = {
+                "success": False,
+                "error": "profile_exhausted",
+                "message": "stub: sin rotacion",
+                "reason": "accounts_submenu_missing",
+                "rotations": 0,
+            }
+            return server.error_response("profile_exhausted", 500, details=result)
+        return server.success_response(
+            data={"port": port, "stub": True, "retried": True},
+            message="stub retry success",
+        )
+
+    # Limpiar cualquier exhausted residual y reset del cache
+    profile_pool.clear_exhausted_ports()
+    profile_pool._last_discovery_at = 0.0
+
+    # Aplicar patches
+    profile_pool.classify_port = fake_classify  # type: ignore
+    profile_pool._test_cdp_port = fake_test_cdp  # type: ignore
+    server._test_cdp_port = fake_test_cdp  # type: ignore
+    cdp_bridge._test_cdp_port = fake_test_cdp  # type: ignore
+    server._chatgpt_prompt_locked = fake_chatgpt_locked  # type: ignore
+    server.service.get_running_profiles = fake_get_running  # type: ignore
+    # Inyectar fake_close como bound-ish method
+    server.service.close_profile_by_port = lambda port: fake_close_by_port(port)  # type: ignore
+
+    try:
+        r = client.post("/chatgpt/prompt", json={
+            "port": IMAGE_PORT_A, "prompt": "p", "auto_rotate": False,
+        })
+        print(f"  status={r.status_code} call_log={call_log} close_log={close_log}")
+        print(f"  exhausted_ports={profile_pool.list_exhausted_ports()}")
+        print(f"  running_despues={[p['debug_port'] for p in running_state['profiles']]}")
+
+        assert r.status_code == 200, f"esperado 200 tras retry, got {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("success") is True, f"body: {body}"
+        assert body["data"]["port"] == IMAGE_PORT_B, "el retry deberia haber usado port B"
+        assert body["data"].get("retried") is True
+        assert call_log == [IMAGE_PORT_A, IMAGE_PORT_B], f"call_log: {call_log}"
+        assert close_log == [IMAGE_PORT_A], f"close_log: {close_log}"
+        # exhausted_ports se auto-limpia cuando el puerto ya no esta running
+        # (es parte del diseño de discover_pools). Verificamos que A salio
+        # del running state en vez.
+        assert IMAGE_PORT_A not in [p["debug_port"] for p in running_state["profiles"]]
+        print("  PASS — perfil A cerrado, retry en B exitoso")
+    finally:
+        # Restaurar patches
+        profile_pool.classify_port = original_classify  # type: ignore
+        profile_pool._test_cdp_port = original_test_cdp  # type: ignore
+        server._test_cdp_port = original_test_cdp_server  # type: ignore
+        cdp_bridge._test_cdp_port = original_test_cdp_bridge  # type: ignore
+        server._chatgpt_prompt_locked = original_chatgpt_locked  # type: ignore
+        server.service.get_running_profiles = original_get_running  # type: ignore
+        server.service.close_profile_by_port = original_close  # type: ignore
+        profile_pool.clear_exhausted_ports()
+        profile_pool._last_discovery_at = 0.0
+
+
+def test_profile_exhausted_no_alternative_returns_429():
+    """Si no hay otro perfil image para reintentar, debe devolver 429 al orchestrator."""
+    print("\n[TEST 12] profile_exhausted sin alternativa -> 429")
+    reset_log()
+
+    original_chatgpt_locked = server._chatgpt_prompt_locked
+    original_close = server.service.close_profile_by_port
+    original_get_running = server.service.get_running_profiles
+
+    running_state = {"profiles": list(_fake_running)}
+
+    def fake_get_running():
+        return list(running_state["profiles"])
+
+    def fake_close_by_port(port):
+        running_state["profiles"] = [
+            p for p in running_state["profiles"] if p["debug_port"] != port
+        ]
+        return True
+
+    def fake_chatgpt_locked(req, port):
+        result = {"success": False, "error": "profile_exhausted", "reason": "accounts_submenu_missing"}
+        return server.error_response("profile_exhausted", 500, details=result)
+
+    profile_pool.clear_exhausted_ports()
+    profile_pool._last_discovery_at = 0.0
+
+    server._chatgpt_prompt_locked = fake_chatgpt_locked  # type: ignore
+    server.service.close_profile_by_port = fake_close_by_port  # type: ignore
+    server.service.get_running_profiles = fake_get_running  # type: ignore
+
+    try:
+        r = client.post("/chatgpt/prompt", json={
+            "port": FAKE_IMAGE_PORT, "prompt": "p", "auto_rotate": False,
+        })
+        print(f"  status={r.status_code}")
+        print(f"  body={r.json()}")
+        assert r.status_code == 429, f"esperado 429, got {r.status_code}"
+        body = r.json()
+        assert body["error"] == "profile_exhausted"
+        details = body["details"]
+        assert FAKE_IMAGE_PORT in details["exhausted_ports"]
+        assert "hint" in details
+        print("  PASS — 429 con hint claro para que el orchestrator abra otro perfil")
+    finally:
+        server._chatgpt_prompt_locked = original_chatgpt_locked  # type: ignore
+        server.service.close_profile_by_port = original_close  # type: ignore
+        server.service.get_running_profiles = original_get_running  # type: ignore
+        profile_pool.clear_exhausted_ports()
+        profile_pool._last_discovery_at = 0.0
 
 
 def test_shutdown_event_interrupts_sleep():
@@ -430,13 +617,15 @@ def main():
     tests = [
         test_pools_endpoint,
         test_resolve_routing_correct_pool,
-        test_resolve_routing_wrong_pool_redirects,
+        test_resolve_routing_trusts_client_port,
         test_resolve_routing_dead_port,
         test_concurrent_image_and_video_run_in_parallel,
         test_concurrent_two_image_serialize,
         test_concurrent_two_video_serialize,
         test_mixed_burst_three_image_one_video,
-        test_pools_endpoint_shows_lock_busy_during_request,
+        test_pools_endpoint_shows_port_lock_and_semaphore_in_use,
+        test_profile_exhausted_retry_closes_and_retries,
+        test_profile_exhausted_no_alternative_returns_429,
         test_shutdown_event_interrupts_sleep,
     ]
     print(f"{'='*70}")
