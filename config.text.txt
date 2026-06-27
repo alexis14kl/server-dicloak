@@ -1,0 +1,27 @@
+# 🚀 Guía de instalación y ejecución - server_dicloak
+
+Este documento explica cómo ejecutar el proyecto `server_dicloak` desde cero en Windows, incluyendo los errores comunes y cómo solucionarlos.
+
+---
+
+## 📁 Estructura del proyecto
+
+El proyecto contiene archivos como:
+
+- `server.py` (punto de entrada del servidor)
+- `cdp_bridge.py` (conexión con DICloak/CDP)
+- `start_server.bat` (script de arranque automático)
+- `api.py`
+- módulos de ChatGPT y Veo3
+- configuración de Redis y logs
+
+---
+
+## ⚠️ Problemas encontrados
+
+Al intentar ejecutar el proyecto por primera vez, aparecieron los siguientes errores:
+
+### 1. Falta de FastAPI
+
+```text
+ModuleNotFoundError: No module named 'fastapi'
