@@ -1,0 +1,121 @@
+====================================================
+  TEST API DICloak — Cookies Cache
+  server.py puerto 8585
+  Fecha: 28-06-2026
+====================================================
+
+COMO IMPORTAR EN POSTMAN:
+  File > Import > Raw text > pegar el curl de una linea
+
+COMO USAR EN N8N:
+  Nodo "HTTP Request" > metodo + URL + Body (JSON)
+  Ver seccion N8N al final de este archivo.
+
+Ejecutar desde CMD parado en la carpeta del proyecto:
+  cd C:\Users\NyGsoft\Desktop\publicidad_david\server_dicloak
+
+
+====================================================
+ CURLS (una linea — compatibles con Postman e n8n)
+====================================================
+
+
+--- 0. HEALTH CHECK ---
+
+curl http://127.0.0.1:8585/health
+
+
+--- 1. LISTAR perfiles de DICloak ---
+
+curl http://127.0.0.1:8585/profiles
+
+
+--- 2. ABRIR perfil ---
+
+curl -X POST http://127.0.0.1:8585/profiles/open -H "Content-Type: application/json" -d "{\"name\": \"#5 Chat Gpt Pro\", \"timeout\": 90}"
+
+
+--- 3. VER perfiles corriendo y sus puertos ---
+
+curl http://127.0.0.1:8585/profiles/running
+
+
+--- 4. EXTRAER y guardar cookies del perfil abierto ---
+
+  OPCION A — perfil abierto via API (nombre se detecta solo):
+curl -X POST "http://127.0.0.1:8585/cookies/extract?port=55915"
+
+  OPCION B — perfil abierto manualmente en DICloak (mandar el nombre):
+curl -X POST http://127.0.0.1:8585/cookies/extract -H "Content-Type: application/json" -d "{\"port\": 55915, \"name\": \"#5 Chat Gpt Pro\"}"
+
+  >> port  = debug_port del perfil (ver paso 3)
+  >> name  = nombre exacto del perfil en DICloak (solo si no lo detecta solo)
+  >> Guarda en: cache\cookies\#5_Chat_Gpt_Pro.json
+
+
+--- 5. VER todos los caches guardados ---
+
+curl http://127.0.0.1:8585/cookies/
+
+
+--- 6. INYECTAR sesion en perfil destino ---
+
+curl -X POST http://127.0.0.1:8585/cookies/inject -H "Content-Type: application/json" -d "{\"port\": 55915, \"file\": \"#5_Chat_Gpt_Pro.json\"}"
+
+  >> port  = debug_port del perfil que va a RECIBIR la sesion
+  >> file  = nombre exacto del .json en cache\cookies\
+
+
+====================================================
+ CONFIGURACION N8N (HTTP Request node)
+====================================================
+
+-- ABRIR PERFIL --
+  Method:  POST
+  URL:     http://127.0.0.1:8585/profiles/open
+  Body:    JSON
+  {
+    "name": "#5 Chat Gpt Pro",
+    "timeout": 90
+  }
+
+-- EXTRAER COOKIES --
+  Method:  POST
+  URL:     http://127.0.0.1:8585/cookies/extract?port=55915
+  Body:    ninguno
+
+-- INYECTAR SESION --
+  Method:  POST
+  URL:     http://127.0.0.1:8585/cookies/inject
+  Body:    JSON
+  {
+    "port": 55915,
+    "file": "#5_Chat_Gpt_Pro.json"
+  }
+
+
+====================================================
+ RESPUESTAS ESPERADAS
+====================================================
+
+Extract:
+  { "success": true, "message": "Cache guardado — perfil: #5 Chat Gpt Pro, 32 cookies" }
+
+Inject:
+  { "success": true, "message": "Sesion inyectada desde '#5_Chat_Gpt_Pro.json': 32 cookies, 31 localStorage keys" }
+
+Lista de caches:
+  { "data": [ { "profile_name": "#5 Chat Gpt Pro", "is_session_valid": true } ] }
+
+
+====================================================
+ ARCHIVOS DE CACHE DISPONIBLES
+====================================================
+
+  #5_Chat_Gpt_Pro.json
+  chat_gpt.json
+  TEST_COOKIE1.json
+
+  (actualizar esta lista al extraer nuevos perfiles)
+
+====================================================

@@ -78,10 +78,13 @@ def find_dicloak_exe() -> str | None:
 def launch_detached(cmd: str) -> None:
     """Lanza un proceso desacoplado (cross-platform)."""
     if IS_WINDOWS:
+        # Sin DETACHED_PROCESS: apps GUI como DICloak (Electron) necesitan acceso
+        # al escritorio del usuario para mostrar su ventana.
+        # CREATE_NEW_PROCESS_GROUP evita que Ctrl+C en el servidor mate al hijo.
         subprocess.Popen(
             cmd,
             shell=True,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

@@ -42,3 +42,6 @@ resource_claude_cdp/screenshots/
 # State files
 .account_rotation_state.json
 requirements.txt
+# Runtime cache (cookies de sesion, NO subir - secretos)
+cache/
+server_log.txt

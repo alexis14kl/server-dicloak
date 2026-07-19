@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import threading
+from cookies_dicloak import inject_shortcuts, build_router
 import time
 import urllib.request
 from pathlib import Path
@@ -567,6 +568,9 @@ def resolve_pool_port(client_port: int, pool: str) -> tuple[int, str]:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+# Cookies router
+app.include_router(build_router(), prefix="/cookies")
+
 @app.get("/")
 def index():
     return success_response(data={
@@ -730,6 +734,21 @@ def pools_status():
 def open_profile(req: OpenProfileRequest):
     try:
         profile = service.open_profile(req.name, req.timeout)
+        # Guardar mapeo port→nombre para smart_extract
+        _dbg = int(profile.get("debug_port") or 0)
+        if _dbg:
+            import json as _j, pathlib as _pl
+            _pm = _pl.Path(__file__).parent / "cache" / "port_map.json"
+            _pm.parent.mkdir(exist_ok=True)
+            _data = _j.loads(_pm.read_text()) if _pm.exists() else {}
+            _data[str(_dbg)] = profile.get("name", req.name)
+            _pm.write_text(_j.dumps(_data, indent=2))
+        # __AUTO_INJECT_SHORTCUTS__
+        _port = int(profile.get("debug_port") or 0)
+        if _port and profile.get("cdp_active"):
+            threading.Thread(
+                target=inject_shortcuts, args=(_port,), daemon=True
+            ).start()
         return success_response(data={"profile": profile}, message=f"Perfil '{req.name}' abierto")
     except ValueError as e:
         return error_response(str(e), 400)
